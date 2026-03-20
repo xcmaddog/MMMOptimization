@@ -166,3 +166,5 @@ plt.title('Contour Plot of Ackley Function')
 plt.legend()
 plt.tight_layout()
 plt.show()
+
+print("Hello World")
