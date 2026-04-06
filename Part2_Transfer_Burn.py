@@ -48,6 +48,9 @@ Input details:
   Assumed backward ejection speed of the discarded mass relative to the rocket
   flight direction during separation. This is used to give the remaining stage
   a forward speed increase while approximately preserving momentum.
+- phase3_collision_lead_hours:
+  If the rocket would impact Mars, phase 3 begins this many hours before the
+  predicted impact so it can attempt a prograde collision-avoidance burn.
 - dt_seconds:
   Output time step in seconds.
   This controls how often the simulation stores points and updates the plot.
@@ -70,6 +73,7 @@ PHASE2_INPUTS = {
     "starting_fuel_mass_kg": 8000.0,
     "remaining_stage_mass_kg": 2500.0,
     "stage_separation_relative_speed_m_s": 50.0,
+    "phase3_collision_lead_hours": 4.0,
     "dt_seconds": 60.0,
     "max_step_seconds": 30.0,
     "total_time_days": 180.0,
@@ -365,6 +369,84 @@ def apply_stage_separation(state, remaining_stage_mass_kg, stage_separation_rela
     )
 
 
+def build_phase3_handoff_state(
+    simulation_start_time_utc,
+    t_seconds,
+    rocket_x_km,
+    rocket_y_km,
+    rocket_vx_km_s,
+    rocket_vy_km_s,
+    rocket_mass_kg,
+    mars_x_km,
+    mars_y_km,
+    mars_vx_km_s,
+    mars_vy_km_s,
+    phase3_collision_lead_hours,
+    status,
+):
+    """
+    Build the phase-3 handoff state near Mars.
+
+    Selection rule:
+    - If the rocket impacts Mars, choose the sample some configurable number
+      of hours before impact.
+    - Otherwise choose the sample of closest approach to Mars.
+    """
+    rocket_to_mars_km = np.hypot(rocket_x_km - mars_x_km, rocket_y_km - mars_y_km)
+
+    if status == "impacted Mars":
+        target_time_seconds = max(0.0, t_seconds[-1] - phase3_collision_lead_hours * 3600.0)
+        handoff_index = int(np.searchsorted(t_seconds, target_time_seconds, side="right") - 1)
+        handoff_reason = f"{phase3_collision_lead_hours:.3f} hours before Mars impact"
+        mars_approach_type = "collision_course"
+        recommended_burn_direction = "prograde_then_retrograde"
+    else:
+        handoff_index = int(np.argmin(rocket_to_mars_km))
+        handoff_reason = "closest approach to Mars"
+        mars_approach_type = "near_pass"
+        recommended_burn_direction = "retrograde_at_closest_pass"
+
+    handoff_datetime_utc = (
+        Time(simulation_start_time_utc, scale="utc") + TimeDelta(t_seconds[handoff_index], format="sec")
+    ).utc.isot
+
+    return {
+        "handoff_reason": handoff_reason,
+        "datetime_utc": handoff_datetime_utc,
+        "elapsed_time_seconds": float(t_seconds[handoff_index]),
+        "elapsed_time_pretty": format_elapsed_time(t_seconds[handoff_index]),
+        "rocket_position_km": {
+            "x": float(rocket_x_km[handoff_index]),
+            "y": float(rocket_y_km[handoff_index]),
+        },
+        "rocket_velocity_km_s": {
+            "vx": float(rocket_vx_km_s[handoff_index]),
+            "vy": float(rocket_vy_km_s[handoff_index]),
+        },
+        "rocket_mass_kg": float(rocket_mass_kg[handoff_index]),
+        "mars_position_km": {
+            "x": float(mars_x_km[handoff_index]),
+            "y": float(mars_y_km[handoff_index]),
+        },
+        "mars_velocity_km_s": {
+            "vx": float(mars_vx_km_s[handoff_index]),
+            "vy": float(mars_vy_km_s[handoff_index]),
+        },
+        "rocket_position_relative_to_mars_km": {
+            "x": float(rocket_x_km[handoff_index] - mars_x_km[handoff_index]),
+            "y": float(rocket_y_km[handoff_index] - mars_y_km[handoff_index]),
+        },
+        "rocket_velocity_relative_to_mars_km_s": {
+            "vx": float(rocket_vx_km_s[handoff_index] - mars_vx_km_s[handoff_index]),
+            "vy": float(rocket_vy_km_s[handoff_index] - mars_vy_km_s[handoff_index]),
+        },
+        "distance_to_mars_km": float(rocket_to_mars_km[handoff_index]),
+        "mars_approach_type": mars_approach_type,
+        "recommended_burn_direction": recommended_burn_direction,
+        "phase3_collision_lead_hours": float(phase3_collision_lead_hours),
+    }
+
+
 def build_final_state(
     simulation_start_time_utc,
     end_datetime_utc,
@@ -390,6 +472,7 @@ def build_final_state(
     stage_separation_datetime_utc,
     stage_separation_delta_v_m_s,
     discarded_stage_mass_kg,
+    phase3_handoff_state,
     status,
 ):
     """Package the end-of-simulation values into one dictionary."""
@@ -413,6 +496,7 @@ def build_final_state(
         "stage_separation_datetime_utc": stage_separation_datetime_utc,
         "stage_separation_delta_v_m_s": float(stage_separation_delta_v_m_s),
         "discarded_stage_mass_kg": float(discarded_stage_mass_kg),
+        "phase3_handoff_state": phase3_handoff_state,
         "status": status,
     }
 
@@ -441,6 +525,7 @@ def simulate_transfer_burn_phase2(
     starting_fuel_mass_kg=PHASE2_INPUTS["starting_fuel_mass_kg"],
     remaining_stage_mass_kg=PHASE2_INPUTS["remaining_stage_mass_kg"],
     stage_separation_relative_speed_m_s=PHASE2_INPUTS["stage_separation_relative_speed_m_s"],
+    phase3_collision_lead_hours=PHASE2_INPUTS["phase3_collision_lead_hours"],
     dt_seconds=PHASE2_INPUTS["dt_seconds"],
     max_step_seconds=PHASE2_INPUTS["max_step_seconds"],
     total_time_days=PHASE2_INPUTS["total_time_days"],
@@ -677,6 +762,22 @@ def simulate_transfer_burn_phase2(
             + TimeDelta(stage_separation_time_seconds, format="sec")
         ).utc.isot
 
+    phase3_handoff_state = build_phase3_handoff_state(
+        simulation_start_time_utc=simulation_start_time_utc,
+        t_seconds=t_seconds,
+        rocket_x_km=rocket_x_km,
+        rocket_y_km=rocket_y_km,
+        rocket_vx_km_s=rocket_vx_km_s,
+        rocket_vy_km_s=rocket_vy_km_s,
+        rocket_mass_kg=rocket_mass_kg,
+        mars_x_km=mars_x_km,
+        mars_y_km=mars_y_km,
+        mars_vx_km_s=mars_vx_km_s,
+        mars_vy_km_s=mars_vy_km_s,
+        phase3_collision_lead_hours=phase3_collision_lead_hours,
+        status=status,
+    )
+
     final_state = build_final_state(
         simulation_start_time_utc=simulation_start_time_utc,
         end_datetime_utc=end_datetime_utc,
@@ -702,6 +803,7 @@ def simulate_transfer_burn_phase2(
         stage_separation_datetime_utc=stage_separation_datetime_utc,
         stage_separation_delta_v_m_s=stage_separation_delta_v_m_s,
         discarded_stage_mass_kg=discarded_stage_mass_kg,
+        phase3_handoff_state=phase3_handoff_state,
         status=status,
     )
 
@@ -728,6 +830,7 @@ def simulate_transfer_burn_phase2(
         "stage_separation_time_seconds": stage_separation_time_seconds,
         "stage_separation_delta_v_m_s": stage_separation_delta_v_m_s,
         "discarded_stage_mass_kg": discarded_stage_mass_kg,
+        "phase3_handoff_state": phase3_handoff_state,
         "status": status,
         "final_state": final_state,
     }
@@ -741,6 +844,7 @@ def animate_transfer_burn_phase2(
     starting_fuel_mass_kg=PHASE2_INPUTS["starting_fuel_mass_kg"],
     remaining_stage_mass_kg=PHASE2_INPUTS["remaining_stage_mass_kg"],
     stage_separation_relative_speed_m_s=PHASE2_INPUTS["stage_separation_relative_speed_m_s"],
+    phase3_collision_lead_hours=PHASE2_INPUTS["phase3_collision_lead_hours"],
     dt_seconds=PHASE2_INPUTS["dt_seconds"],
     max_step_seconds=PHASE2_INPUTS["max_step_seconds"],
     total_time_days=PHASE2_INPUTS["total_time_days"],
@@ -756,6 +860,7 @@ def animate_transfer_burn_phase2(
         starting_fuel_mass_kg=starting_fuel_mass_kg,
         remaining_stage_mass_kg=remaining_stage_mass_kg,
         stage_separation_relative_speed_m_s=stage_separation_relative_speed_m_s,
+        phase3_collision_lead_hours=phase3_collision_lead_hours,
         dt_seconds=dt_seconds,
         max_step_seconds=max_step_seconds,
         total_time_days=total_time_days,
@@ -936,6 +1041,8 @@ def print_handoff_state(phase1_final_state):
 
 def print_final_state(final_state):
     """Print the final phase-2 state and burn summary."""
+    phase3_handoff_state = final_state["phase3_handoff_state"]
+
     print("Final phase 2 state")
     print("-------------------")
     print(f"Status: {final_state['status']}")
@@ -975,6 +1082,25 @@ def print_final_state(final_state):
     print(f"Stage separation date-time (UTC): {final_state['stage_separation_datetime_utc']}")
     print(f"Stage separation delta-v: {final_state['stage_separation_delta_v_m_s']:.3f} m/s")
     print(f"Discarded stage mass: {final_state['discarded_stage_mass_kg']:.3f} kg")
+    print("Phase 3 handoff:")
+    print(f"  Reason: {phase3_handoff_state['handoff_reason']}")
+    print(f"  Date-time (UTC): {phase3_handoff_state['datetime_utc']}")
+    print(f"  Approach type: {phase3_handoff_state['mars_approach_type']}")
+    print(f"  Recommended burn: {phase3_handoff_state['recommended_burn_direction']}")
+    print(
+        f"  Rocket position (km): x = {phase3_handoff_state['rocket_position_km']['x']:.3f}, "
+        f"y = {phase3_handoff_state['rocket_position_km']['y']:.3f}"
+    )
+    print(
+        f"  Rocket velocity (km/s): vx = {phase3_handoff_state['rocket_velocity_km_s']['vx']:.6f}, "
+        f"vy = {phase3_handoff_state['rocket_velocity_km_s']['vy']:.6f}"
+    )
+    print(f"  Rocket mass (kg): {phase3_handoff_state['rocket_mass_kg']:.3f}")
+    print(
+        f"  Mars position (km): x = {phase3_handoff_state['mars_position_km']['x']:.3f}, "
+        f"y = {phase3_handoff_state['mars_position_km']['y']:.3f}"
+    )
+    print(f"  Distance to Mars (km): {phase3_handoff_state['distance_to_mars_km']:.3f}")
 
 
 if __name__ == "__main__":
