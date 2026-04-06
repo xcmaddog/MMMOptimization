@@ -25,10 +25,12 @@ Input details:
   Fuel available for the corrective burn at the start of phase 3.
 - thrust_newtons:
   Corrective-thruster force in newtons.
+- collision_conversion_burn_duration_minutes:
+  Duration of the initial prograde burn used only when phase 2 says the rocket
+  is on a collision course with Mars.
 - requested_burn_duration_minutes:
-  Requested corrective-burn duration in minutes.
-  The burn is applied immediately at the start of phase 3.
-  Fuel is assumed to be spread uniformly across that requested burn time.
+  Duration of the retrograde burn applied at closest pass.
+  In a near-pass case, this is the only burn.
 - dt_seconds:
   Output time step in seconds.
 - max_step_seconds:
@@ -44,6 +46,7 @@ Input details:
 PHASE3_INPUTS = {
     "correction_fuel_mass_kg": 1640.0,
     "thrust_newtons": 1200.0,
+    "collision_conversion_burn_duration_minutes": 30.0,
     "requested_burn_duration_minutes": 30.0,
     "dt_seconds": 180.0,
     "max_step_seconds": 30.0,
@@ -59,7 +62,8 @@ PHASE3_INPUTS = {
 PHASE2_HANDOFF_STATE = {
     "handoff_reason": "closest approach to Mars",
     "mars_approach_type": "near_pass",
-    "recommended_burn_direction": "retrograde",
+    "recommended_burn_direction": "retrograde_at_closest_pass",
+    "phase3_collision_lead_hours": 4.0,
     "datetime_utc": "2025-10-01T00:00:00.000",
     "elapsed_time_seconds": 0.0,
     "elapsed_time_pretty": "0 d  00 h  00 m",
@@ -106,6 +110,14 @@ def thrust_accel_mars_centered(vx_km_s, vy_km_s, thrust_newtons, total_mass_kg, 
     direction_x = direction_sign * (vx_km_s / speed_km_s)
     direction_y = direction_sign * (vy_km_s / speed_km_s)
     return accel_km_s2 * direction_x, accel_km_s2 * direction_y
+
+
+def radial_velocity_km_s(x_km, y_km, vx_km_s, vy_km_s):
+    """Return radial velocity relative to Mars. Negative means inbound."""
+    radius_km = np.hypot(x_km, y_km)
+    if radius_km == 0.0:
+        return 0.0
+    return (x_km * vx_km_s + y_km * vy_km_s) / radius_km
 
 
 def mars_states_heliocentric(t_seconds_array, simulation_start_time_utc):
@@ -227,11 +239,23 @@ def build_final_state(
     mars_vy_km_s,
     rocket_mass_kg,
     fuel_remaining_kg,
+    collision_conversion_burn_duration_minutes,
     requested_burn_duration_minutes,
-    actual_burn_duration_seconds,
+    initial_actual_burn_duration_seconds,
+    closest_pass_actual_burn_duration_seconds,
     thrust_newtons,
-    correction_burn_direction,
     mars_approach_type,
+    initial_burn_applied,
+    initial_burn_direction,
+    initial_burn_duration_seconds,
+    closest_pass_burn_applied,
+    closest_pass_burn_duration_seconds,
+    stable_orbit_detected,
+    first_closest_pass_distance_km,
+    first_closest_pass_datetime_utc,
+    returned_inward_after_first_pass,
+    resumed_outward_after_return,
+    orbit_confirmation_datetime_utc,
     status,
 ):
     """Package the phase-3 end state in both Mars-relative and Sun-relative form."""
@@ -257,11 +281,25 @@ def build_final_state(
         "rocket_angle_deg": float(rocket_angle_deg),
         "rocket_mass_kg": float(rocket_mass_kg),
         "fuel_remaining_kg": float(fuel_remaining_kg),
+        "collision_conversion_burn_duration_minutes": float(collision_conversion_burn_duration_minutes),
         "requested_burn_duration_minutes": float(requested_burn_duration_minutes),
-        "actual_burn_duration_minutes": float(actual_burn_duration_seconds / 60.0),
+        "initial_actual_burn_duration_minutes": float(initial_actual_burn_duration_seconds / 60.0),
+        "closest_pass_actual_burn_duration_minutes": float(closest_pass_actual_burn_duration_seconds / 60.0),
         "thrust_newtons": float(thrust_newtons),
-        "correction_burn_direction": correction_burn_direction,
         "mars_approach_type": mars_approach_type,
+        "initial_burn_applied": initial_burn_applied,
+        "initial_burn_direction": initial_burn_direction,
+        "initial_burn_duration_minutes": float(initial_burn_duration_seconds / 60.0),
+        "closest_pass_burn_applied": closest_pass_burn_applied,
+        "closest_pass_burn_duration_minutes": float(closest_pass_burn_duration_seconds / 60.0),
+        "stable_orbit_detected": stable_orbit_detected,
+        "first_closest_pass_distance_km": None
+        if first_closest_pass_distance_km is None
+        else float(first_closest_pass_distance_km),
+        "first_closest_pass_datetime_utc": first_closest_pass_datetime_utc,
+        "returned_inward_after_first_pass": returned_inward_after_first_pass,
+        "resumed_outward_after_return": resumed_outward_after_return,
+        "orbit_confirmation_datetime_utc": orbit_confirmation_datetime_utc,
         "status": status,
     }
 
@@ -269,6 +307,7 @@ def build_final_state(
 def simulate_mars_orbit_phase3(
     correction_fuel_mass_kg=PHASE3_INPUTS["correction_fuel_mass_kg"],
     thrust_newtons=PHASE3_INPUTS["thrust_newtons"],
+    collision_conversion_burn_duration_minutes=PHASE3_INPUTS["collision_conversion_burn_duration_minutes"],
     requested_burn_duration_minutes=PHASE3_INPUTS["requested_burn_duration_minutes"],
     dt_seconds=PHASE3_INPUTS["dt_seconds"],
     max_step_seconds=PHASE3_INPUTS["max_step_seconds"],
@@ -282,15 +321,14 @@ def simulate_mars_orbit_phase3(
     Modeling assumptions:
     - Mars stays fixed at the origin for the local rocket dynamics.
     - The rocket feels Mars' gravity only.
-    - A corrective burn is applied immediately at the start of phase 3.
-    - The burn direction comes from the phase-2 handoff classification:
-      retrograde for a near pass and prograde for a collision course.
+    - Collision cases begin before impact and receive an initial prograde burn.
+    - Near-pass cases coast at first.
+    - Once closest pass is reached, a retrograde burn is applied to either case.
     - Mars heliocentric states are still tracked with Astropy.
     - Rocket heliocentric output is reconstructed from the Mars-relative state.
     """
     handoff_state = PHASE2_HANDOFF_STATE
     simulation_start_time_utc = handoff_state["datetime_utc"]
-    correction_burn_direction = handoff_state.get("recommended_burn_direction", "retrograde")
     mars_approach_type = handoff_state.get("mars_approach_type", "near_pass")
     handoff_total_mass_kg = handoff_state.get("rocket_mass_kg", 0.0)
     dry_mass_kg = max(0.0, handoff_total_mass_kg - correction_fuel_mass_kg)
@@ -322,17 +360,40 @@ def simulate_mars_orbit_phase3(
     rocket_mass_kg[0] = handoff_total_mass_kg
     fuel_mass_kg[0] = min(correction_fuel_mass_kg, handoff_total_mass_kg)
 
+    collision_conversion_burn_duration_seconds = max(0.0, collision_conversion_burn_duration_minutes * 60.0)
     requested_burn_duration_seconds = max(0.0, requested_burn_duration_minutes * 60.0)
-    if requested_burn_duration_seconds > 0.0 and correction_fuel_mass_kg > 0.0 and thrust_newtons > 0.0:
-        mass_flow_kg_s = correction_fuel_mass_kg / requested_burn_duration_seconds
-        actual_burn_duration_seconds = requested_burn_duration_seconds
+    total_planned_burn_seconds = requested_burn_duration_seconds
+    if mars_approach_type == "collision_course":
+        total_planned_burn_seconds += collision_conversion_burn_duration_seconds
+
+    if total_planned_burn_seconds > 0.0 and correction_fuel_mass_kg > 0.0 and thrust_newtons > 0.0:
+        mass_flow_kg_s = correction_fuel_mass_kg / total_planned_burn_seconds
     else:
         mass_flow_kg_s = 0.0
-        actual_burn_duration_seconds = 0.0
 
     status = "observing Mars encounter"
     stop_index = n_output_steps
-    burn_elapsed_seconds = 0.0
+    initial_burn_enabled = (
+        mars_approach_type == "collision_course"
+        and collision_conversion_burn_duration_seconds > 0.0
+        and thrust_newtons > 0.0
+        and fuel_mass_kg[0] > 0.0
+    )
+    initial_burn_direction = "prograde" if initial_burn_enabled else "none"
+    initial_burn_elapsed_seconds = 0.0
+    closest_pass_burn_started = False
+    closest_pass_burn_elapsed_seconds = 0.0
+    first_closest_pass_distance_km = None
+    first_closest_pass_time_seconds = None
+    returned_inward_after_first_pass = False
+    resumed_outward_after_return = False
+    orbit_confirmation_time_seconds = None
+    previous_radial_velocity = radial_velocity_km_s(
+        rocket_rel_x_km[0],
+        rocket_rel_y_km[0],
+        rocket_rel_vx_km_s[0],
+        rocket_rel_vy_km_s[0],
+    )
 
     for i in range(n_output_steps - 1):
         interval_seconds = t_seconds[i + 1] - t_seconds[i]
@@ -355,9 +416,30 @@ def simulate_mars_orbit_phase3(
             remaining_interval_seconds = interval_seconds - interval_elapsed
             substep_seconds = min(max_step_seconds, remaining_interval_seconds)
 
-            burn_active = burn_elapsed_seconds < actual_burn_duration_seconds - 1e-12
+            active_burn_direction = None
+            active_burn_elapsed_seconds = 0.0
+            if (
+                initial_burn_enabled
+                and initial_burn_elapsed_seconds < collision_conversion_burn_duration_seconds - 1e-12
+                and state[5] > 0.0
+            ):
+                active_burn_direction = "prograde"
+                active_burn_elapsed_seconds = initial_burn_elapsed_seconds
+                active_burn_target_seconds = collision_conversion_burn_duration_seconds
+            elif (
+                closest_pass_burn_started
+                and closest_pass_burn_elapsed_seconds < requested_burn_duration_seconds - 1e-12
+                and state[5] > 0.0
+            ):
+                active_burn_direction = "retrograde"
+                active_burn_elapsed_seconds = closest_pass_burn_elapsed_seconds
+                active_burn_target_seconds = requested_burn_duration_seconds
+            else:
+                active_burn_target_seconds = 0.0
+
+            burn_active = active_burn_direction is not None
             if burn_active:
-                remaining_burn_seconds = actual_burn_duration_seconds - burn_elapsed_seconds
+                remaining_burn_seconds = active_burn_target_seconds - active_burn_elapsed_seconds
                 substep_seconds = min(substep_seconds, remaining_burn_seconds)
 
             rocket_radius_km = np.hypot(state[0], state[1])
@@ -382,15 +464,42 @@ def simulate_mars_orbit_phase3(
                 thrust_on=burn_active,
                 thrust_newtons=thrust_newtons,
                 mass_flow_kg_s=mass_flow_kg_s,
-                burn_direction=correction_burn_direction,
+                burn_direction=active_burn_direction or "retrograde",
                 mars_mu_km=mars_mu_km,
             )
             state[5] = max(0.0, state[5])
             state[4] = max(dry_mass_kg, state[4])
 
             interval_elapsed += substep_seconds
-            if burn_active:
-                burn_elapsed_seconds += substep_seconds
+            if active_burn_direction == "prograde":
+                initial_burn_elapsed_seconds += substep_seconds
+            elif active_burn_direction == "retrograde":
+                closest_pass_burn_elapsed_seconds += substep_seconds
+
+            current_radial_velocity = radial_velocity_km_s(state[0], state[1], state[2], state[3])
+            if (
+                previous_radial_velocity < 0.0
+                and current_radial_velocity >= 0.0
+            ):
+                periapsis_distance_km = np.hypot(state[0], state[1])
+                periapsis_time_seconds = t_seconds[i] + interval_elapsed
+
+                if first_closest_pass_distance_km is None:
+                    first_closest_pass_distance_km = periapsis_distance_km
+                    first_closest_pass_time_seconds = periapsis_time_seconds
+                    closest_pass_burn_started = (
+                        requested_burn_duration_seconds > 0.0 and thrust_newtons > 0.0 and state[5] > 0.0
+                    )
+                elif returned_inward_after_first_pass and not resumed_outward_after_return:
+                    resumed_outward_after_return = True
+                    orbit_confirmation_time_seconds = periapsis_time_seconds
+            elif (
+                first_closest_pass_time_seconds is not None
+                and not returned_inward_after_first_pass
+                and current_radial_velocity < 0.0
+            ):
+                returned_inward_after_first_pass = True
+            previous_radial_velocity = current_radial_velocity
 
         if not interval_completed:
             break
@@ -442,11 +551,27 @@ def simulate_mars_orbit_phase3(
         mars_vy_km_s=mars_vy_km_s[-1],
         rocket_mass_kg=rocket_mass_kg[-1],
         fuel_remaining_kg=fuel_mass_kg[-1],
+        collision_conversion_burn_duration_minutes=collision_conversion_burn_duration_minutes,
         requested_burn_duration_minutes=requested_burn_duration_minutes,
-        actual_burn_duration_seconds=actual_burn_duration_seconds,
+        initial_actual_burn_duration_seconds=initial_burn_elapsed_seconds,
+        closest_pass_actual_burn_duration_seconds=closest_pass_burn_elapsed_seconds,
         thrust_newtons=thrust_newtons,
-        correction_burn_direction=correction_burn_direction,
         mars_approach_type=mars_approach_type,
+        initial_burn_applied=initial_burn_elapsed_seconds > 0.0,
+        initial_burn_direction=initial_burn_direction,
+        initial_burn_duration_seconds=initial_burn_elapsed_seconds,
+        closest_pass_burn_applied=closest_pass_burn_elapsed_seconds > 0.0,
+        closest_pass_burn_duration_seconds=closest_pass_burn_elapsed_seconds,
+        stable_orbit_detected=(status != "impacted Mars" and returned_inward_after_first_pass and resumed_outward_after_return),
+        first_closest_pass_distance_km=first_closest_pass_distance_km,
+        first_closest_pass_datetime_utc=None
+        if first_closest_pass_time_seconds is None
+        else (Time(simulation_start_time_utc, scale="utc") + TimeDelta(first_closest_pass_time_seconds, format="sec")).utc.isot,
+        returned_inward_after_first_pass=returned_inward_after_first_pass,
+        resumed_outward_after_return=resumed_outward_after_return,
+        orbit_confirmation_datetime_utc=None
+        if orbit_confirmation_time_seconds is None
+        else (Time(simulation_start_time_utc, scale="utc") + TimeDelta(orbit_confirmation_time_seconds, format="sec")).utc.isot,
         status=status,
     )
 
@@ -475,6 +600,7 @@ def simulate_mars_orbit_phase3(
 def animate_mars_orbit_phase3(
     correction_fuel_mass_kg=PHASE3_INPUTS["correction_fuel_mass_kg"],
     thrust_newtons=PHASE3_INPUTS["thrust_newtons"],
+    collision_conversion_burn_duration_minutes=PHASE3_INPUTS["collision_conversion_burn_duration_minutes"],
     requested_burn_duration_minutes=PHASE3_INPUTS["requested_burn_duration_minutes"],
     dt_seconds=PHASE3_INPUTS["dt_seconds"],
     max_step_seconds=PHASE3_INPUTS["max_step_seconds"],
@@ -490,6 +616,7 @@ def animate_mars_orbit_phase3(
     simulation = simulate_mars_orbit_phase3(
         correction_fuel_mass_kg=correction_fuel_mass_kg,
         thrust_newtons=thrust_newtons,
+        collision_conversion_burn_duration_minutes=collision_conversion_burn_duration_minutes,
         requested_burn_duration_minutes=requested_burn_duration_minutes,
         dt_seconds=dt_seconds,
         max_step_seconds=max_step_seconds,
@@ -504,7 +631,7 @@ def animate_mars_orbit_phase3(
     rocket_mass_kg = simulation["rocket_mass_kg"]
     fuel_mass_kg = simulation["fuel_mass_kg"]
     status = simulation["status"]
-    handoff_state = PHASE2_HANDOFF_STATE
+    phase3_summary = simulation["final_state"]
 
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.set_aspect("equal")
@@ -560,8 +687,14 @@ def animate_mars_orbit_phase3(
 
         speed_km_s = np.hypot(rocket_rel_vx_km_s[i], rocket_rel_vy_km_s[i])
         altitude_now_km = np.hypot(rocket_rel_x_km[i], rocket_rel_y_km[i]) - MARS_RADIUS_KM
-        burn_active = t_seconds[i] < requested_burn_duration_minutes * 60.0 and fuel_mass_kg[i] > 0.0
-        burn_status = f"{handoff_state.get('recommended_burn_direction', 'retrograde')} burn active" if burn_active else "burn complete"
+        if phase3_summary["initial_burn_applied"] and not phase3_summary["closest_pass_burn_applied"]:
+            burn_status = "collision-conversion strategy active"
+        elif phase3_summary["initial_burn_applied"] and phase3_summary["closest_pass_burn_applied"]:
+            burn_status = "two-burn strategy completed"
+        elif phase3_summary["closest_pass_burn_applied"]:
+            burn_status = "closest-pass capture burn completed"
+        else:
+            burn_status = "coasting"
 
         info.set_text(
             f"time = {format_elapsed_time(t_seconds[i])}\n"
@@ -617,10 +750,26 @@ def print_final_state(final_state):
     )
     print(f"Rocket final angle around Mars: {final_state['rocket_angle_deg']:.3f} deg")
     print(f"Mars approach type from phase 2: {final_state['mars_approach_type']}")
-    print(f"Corrective burn direction: {final_state['correction_burn_direction']}")
     print(f"Thrust: {final_state['thrust_newtons']:.3f} N")
+    print(
+        f"Collision-conversion burn duration setting: "
+        f"{final_state['collision_conversion_burn_duration_minutes']:.3f} min"
+    )
     print(f"Requested burn duration: {final_state['requested_burn_duration_minutes']:.3f} min")
-    print(f"Actual burn duration: {final_state['actual_burn_duration_minutes']:.3f} min")
+    print(f"Initial burn applied: {final_state['initial_burn_applied']}")
+    print(f"Initial burn direction: {final_state['initial_burn_direction']}")
+    print(f"Initial actual burn duration: {final_state['initial_actual_burn_duration_minutes']:.3f} min")
+    print(f"Closest-pass burn applied: {final_state['closest_pass_burn_applied']}")
+    print(
+        f"Closest-pass actual burn duration: "
+        f"{final_state['closest_pass_actual_burn_duration_minutes']:.3f} min"
+    )
+    print(f"Stable orbit detected: {final_state['stable_orbit_detected']}")
+    print(f"First closest-pass date-time (UTC): {final_state['first_closest_pass_datetime_utc']}")
+    print(f"First closest-pass distance (km): {final_state['first_closest_pass_distance_km']}")
+    print(f"Returned inward after first pass: {final_state['returned_inward_after_first_pass']}")
+    print(f"Resumed outward after return: {final_state['resumed_outward_after_return']}")
+    print(f"Orbit confirmation date-time (UTC): {final_state['orbit_confirmation_datetime_utc']}")
     print(f"Rocket mass: {final_state['rocket_mass_kg']:.3f} kg")
     print(f"Fuel remaining: {final_state['fuel_remaining_kg']:.3f} kg")
     print(
