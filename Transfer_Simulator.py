@@ -67,7 +67,7 @@ Input details:
 PHASE1_SETTINGS = {
     "launch_altitude_km": 200.0,
     "initial_velocity_km_s": None,
-    "launch_angle_deg": 133.01, #Design variable
+    "launch_angle_deg": 133.02, #Design variable
     "simulation_start_time_utc": "2020-09-02T00:00:00", #Design variable
     "dt_seconds": 180.0, #Frequency of saved data points (steps)
     "max_step_seconds": 30.0, #Frequency of physics calculations (like sub-steps)
@@ -128,7 +128,7 @@ PHASE2_SETTINGS = {
     "stage_separation_relative_speed_m_s": 50.0, #Design variable? Or maybe just constant
     "phase3_collision_lead_hours": 10.0, #Probably just constant
     "dt_seconds": 180.0, #Frequency of saved data points (steps)
-    "max_step_seconds": 30.0, #Frequency of physics calculations (like sub-steps)
+    "max_step_seconds": 60.0, #Frequency of physics calculations (like sub-steps)
     "total_time_days": 150.0, 
     "playback_speed": 5.0,
     "fps": 60,
@@ -349,8 +349,4 @@ def run_transfer_simulator(
 
 
 if __name__ == "__main__":
-<<<<<<< HEAD
     run_transfer_simulator()
-=======
-    run_transfer_simulator()
->>>>>>> e6f6ea9f439fb1fd798bf9c44c6e7ddf7336d6d0
