@@ -69,9 +69,9 @@ PHASE1_SETTINGS = {
     "initial_velocity_km_s": None,
     "launch_angle_deg": 133.01, #Design variable
     "simulation_start_time_utc": "2020-09-02T00:00:00", #Design variable
-    "dt_seconds": 180.0,
-    "max_step_seconds": 60.0,
-    "total_time_days": 1.0, #Design variable
+    "dt_seconds": 180.0, #Frequency of saved data points (steps)
+    "max_step_seconds": 30.0, #Frequency of physics calculations (like sub-steps)
+    "total_time_days": 1.0, #Design variable (But maybe just 0)
     "playback_speed": 0.5,
     "fps": 30,
 }
@@ -121,15 +121,15 @@ Input details:
 PHASE2_SETTINGS = {
     "requested_burn_duration_minutes": 60.0, #Design variable
     "thrust_newtons": 100000.0, #Design variable
-    "initial_total_mass_kg": 12000.0,
-    "burn_rate_kg_per_min": 1346.0,
-    "starting_fuel_mass_kg": 8500.0,
-    "remaining_stage_mass_kg": 2500.0,
-    "stage_separation_relative_speed_m_s": 50.0,
-    "phase3_collision_lead_hours": 10.0,
-    "dt_seconds": 180.0,
-    "max_step_seconds": 30.0,
-    "total_time_days": 150.0,
+    "initial_total_mass_kg": 12000.0, #Design variable 
+    "burn_rate_kg_per_min": 1346.0, #Design variable
+    "starting_fuel_mass_kg": 8500.0, #Design variable (can't be greater than initial mass)
+    "remaining_stage_mass_kg": 2500.0, #Design variable
+    "stage_separation_relative_speed_m_s": 50.0, #Design variable? Or maybe just constant
+    "phase3_collision_lead_hours": 10.0, #Probably just constant
+    "dt_seconds": 180.0, #Frequency of saved data points (steps)
+    "max_step_seconds": 30.0, #Frequency of physics calculations (like sub-steps)
+    "total_time_days": 150.0, 
     "playback_speed": 5.0,
     "fps": 60,
 }
@@ -171,8 +171,8 @@ PHASE3_SETTINGS = {
     "thrust_newtons": 1200.0,
     "collision_conversion_burn_duration_minutes": 25.0, #Design variable
     "requested_burn_duration_minutes": 32, #Design variable
-    "dt_seconds": 180.0,
-    "max_step_seconds": 30.0,
+    "dt_seconds": 180.0, #Frequency of saved data points (steps)
+    "max_step_seconds": 30.0, #Frequency of physics calculations (like sub-steps)
     "total_time_days": 10.0,
     "playback_speed": 1.5,
     "fps": 30,
