@@ -349,4 +349,8 @@ def run_transfer_simulator(
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     run_transfer_simulator()
+=======
+    run_transfer_simulator()
+>>>>>>> e6f6ea9f439fb1fd798bf9c44c6e7ddf7336d6d0

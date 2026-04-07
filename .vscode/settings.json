@@ -1,4 +1,11 @@
 {
+<<<<<<< HEAD
     "python-envs.defaultEnvManager": "ms-python.python:venv",
     "python-envs.defaultPackageManager": "ms-python.python:pip"
+=======
+    "files.associations": {
+        "*.ttml": "xml",
+        "*.ttss": "css"
+    }
+>>>>>>> e6f6ea9f439fb1fd798bf9c44c6e7ddf7336d6d0
 }
