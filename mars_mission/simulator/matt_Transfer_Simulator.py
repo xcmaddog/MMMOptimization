@@ -1,6 +1,6 @@
-import mars_mission.simulator.Part1_Earth_Idle as phase1
-import mars_mission.simulator.Part2_Transfer_Burn as phase2
-import mars_mission.simulator.Part3_Mars_Burn as phase3
+import Part1_Earth_Idle as phase1
+import Part2_Transfer_Burn as phase2
+import Part3_Mars_Burn as phase3
 
 
 """
