@@ -75,7 +75,7 @@ PHASE2_INPUTS = {
     "stage_separation_relative_speed_m_s": 50.0,
     "phase3_collision_lead_hours": 4.0,
     "dt_seconds": 60.0,
-    "max_step_seconds": 30.0,
+    "max_step_seconds": 60.0,
     "total_time_days": 180.0,
     "playback_speed": 5.0,
     "fps": 60,

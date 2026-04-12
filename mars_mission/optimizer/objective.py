@@ -1,444 +1,510 @@
 """
 objective.py
 ------------
-Core objective function that bridges Matt's three-phase N-body simulator
-with the pymoo optimiser.
+Core objective function bridging Matt's three-phase N-body simulator with pymoo.
+
+Architecture notes
+------------------
+1.  Mass split: TMI fuel vs. MOI fuel
+    Phase 2 burns `starting_fuel_mass_kg`, drops the spent stage, and keeps
+    `remaining_stage_mass_kg`. Phase 3 burns `correction_fuel_mass_kg` from
+    that remaining mass.  The hard constraint from Part2 is:
+
+        remaining_stage_mass_kg  <  initial_total_mass_kg − starting_fuel_mass_kg
+
+    We satisfy this by adding MASS_BUFFER_KG to initial_total_mass_kg, so
+    remaining_stage is always strictly less than the non-TMI-fuel portion.
+
+2.  Launch angle: finite-burn arc correction
+    A TMI burn of duration T_burn spans an arc of the LEO parking orbit:
+        arc_deg = (T_burn / T_orbit) × 360
+
+    Lambert assumes an instantaneous burn at a single point.  We shift the
+    burn start so its midpoint aligns with the Lambert departure v_inf:
+        launch_angle = arctan2(−v_inf_x, v_inf_y) − arc_deg/2   (mod 360)
+
+3.  Epoch bounds: Sep–Dec 2026 Earth-Mars synodic window
+    The simulator is 2D (ecliptic plane).  Diagnostic scanning shows that
+    Mars is within 5–10% of the ecliptic during the September–October 2026
+    opposition window, making 2D trajectories physically accurate.
+    Feasible Lambert dV values (< 12 km/s total) exist only in the range
+    JD 2461270–2461410 (2026-08-12 to 2027-01-01).
+
+    KNOWN GOOD (epoch_jd, tof_days) SEED POINTS from Lambert scan:
+        (2461294.5, 250)  →  dV = 8.77 km/s   (2026-09-11 dep, 250d TOF)
+        (2461314.5, 200)  →  dV = 11.82 km/s  (2026-10-01 dep, 200d TOF)
+        (2461314.5, 250)  →  dV = 8.22 km/s   (2026-10-01 dep, 250d TOF)
+        (2461335.5, 200)  →  dV = 9.47 km/s   (2026-10-22 dep, 200d TOF)
+        (2461370.5, 210)  →  dV = 7.18 km/s   (2026-11-26 dep, 210d TOF)
 
 Design vector layout
 --------------------
-The optimiser passes a 1-D array x with the following elements.
-All bounds and indices are defined in DESIGN_VARIABLE_SPEC at the bottom
-of this file so that problem.py and runner.py can read them without
-duplicating magic numbers.
-
-    Index  Name                               Units
-    -----  ---------------------------------  -----
-      0    launch_epoch_jd                    Julian Date
-      1    leo_coast_days          (Phase 1)  days  (time in parking orbit)
-      2    launch_angle_deg        (Phase 1)  degrees
-      3    burn_duration_min       (Phase 2)  minutes
-      4    thrust_newtons          (Phase 2)  N
-      5    initial_total_mass_kg   (Phase 2)  kg
-      6    starting_fuel_mass_kg   (Phase 2)  kg
-      7    remaining_stage_mass_kg (Phase 2)  kg
-      8    moi_burn_duration_min   (Phase 3)  minutes  (retrograde capture burn)
-
-Propellant type is discrete and handled outside this vector — the caller
-instantiates one objective instance per propellant, or uses
-`evaluate_all_propellants()` to sweep them all.
-
-Constants threaded through from the caller
-------------------------------------------
-- propellant             : Propellant  (sets Isp and burn_rate)
-- payload_mass_kg        : float       (payload delivered to Mars orbit)
-- stage_sep_speed_m_s    : float       (stage separation ΔV model parameter)
-- phase3_lead_hours      : float       (collision-course lead time for MOI)
-- p1_dt_s / p2_dt_s / p3_dt_s  : output timestep for each phase (speed knob)
-- p2_total_days          : float       (max phase 2 sim duration)
-- p3_total_days          : float       (max phase 3 sim duration)
-
-Feasibility
------------
-A run is considered feasible when Phase 3 reports stable_orbit_detected=True.
-Infeasible runs return BIG_PENALTY objectives and a positive constraint value
-so that pymoo's dominance ranking pushes them out of the Pareto front.
-
-Caching
--------
-Each ObjectiveFunction instance owns a local dict keyed on a rounded tuple
-of x.  This deduplicates within a single worker process.  When running with
-multiprocessing (pymoo's ElementwiseProblem + StarmapParallelRunner), each
-worker has its own cache — cross-worker deduplication is not attempted
-because NSGA-II rarely revisits identical points.
+   Idx  Name               Units   Bounds
+    0   launch_epoch_jd    JD      2461270 – 2461410
+    1   tof_days           days    130 – 300
+    2   thrust_newtons     N       50 000 – 500 000
+    3   m_struct_kg        kg      2 000 – 15 000
+    4   moi_fuel_fraction  –       0.10 – 0.55
+    5   total_fuel_kg      kg      5 000 – 150 000
+    6   leo_coast_days     days    0 – 1
 """
 
 from __future__ import annotations
 
-import warnings
-from typing import Any
-
+import os, sys, warnings
 import numpy as np
+import astropy.units as u
 from astropy.time import Time
 
-from simulator.me_transfer_simulator import (
-    run_phase1,
-    run_phase2,
-    run_phase3,
-)
-from optimizer.propellants import (
-    Propellant,
-    PROPELLANTS,
-    burn_rate_kg_per_min,
-)
+from simulator.me_transfer_simulator import run_phase1, run_phase2, run_phase3
+
+_MT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'mars_transfer'))
+if _MT not in sys.path:
+    sys.path.insert(0, _MT)
+from mars_transfer.ephemeris.ephemeris import get_heliocentric_state
+from mars_transfer.trajectory.lambert import _lambert_universal, MU_SUN, solve_lambert
+
+from optimizer.propellants import Propellant, PROPELLANTS, burn_rate_kg_per_min
 from cost.cost import estimate_cost
 
 # ---------------------------------------------------------------------------
-# Penalty value for infeasible / crashed runs
+# Constants
 # ---------------------------------------------------------------------------
+G0_KM_S2     = 9.80665e-3
+EARTH_MU_KM  = 398_600.4418
+LEO_ALT_KM   = 200.0
+LEO_R_KM     = 6_378.0 + LEO_ALT_KM
+LEO_PERIOD_S = 2.0 * np.pi * np.sqrt(LEO_R_KM**3 / EARTH_MU_KM)
+MASS_BUFFER_KG = 200.0
 BIG = 1e9
-
 
 # ---------------------------------------------------------------------------
 # Design variable specification
-# Consumed by problem.py to set bounds without duplicating magic numbers.
 # ---------------------------------------------------------------------------
+# Epoch bounds: Sep 2026 – Jan 2027 Earth-Mars window (2D sim compatible)
 DESIGN_VARIABLE_SPEC: list[dict] = [
-    # idx  name                          lb            ub      description
-    {"name": "launch_epoch_jd",          "lb": 2_460_800.5, "ub": 2_461_500.5},   # ~Sep 2025 – Aug 2027
-    {"name": "leo_coast_days",           "lb": 0.0,         "ub": 2.0},            # days in LEO before burn
-    {"name": "launch_angle_deg",         "lb": 0.0,         "ub": 360.0},          # angle around Earth orbit
-    {"name": "burn_duration_min",        "lb": 1.0,         "ub": 120.0},          # Phase 2 burn
-    {"name": "thrust_newtons",           "lb": 10_000.0,    "ub": 500_000.0},      # engine thrust
-    {"name": "initial_total_mass_kg",    "lb": 5_000.0,     "ub": 200_000.0},      # wet mass at burn start
-    {"name": "starting_fuel_mass_kg",    "lb": 1_000.0,     "ub": 150_000.0},      # propellant budget
-    {"name": "remaining_stage_mass_kg",  "lb": 500.0,       "ub": 20_000.0},       # post-sep dry mass
-    {"name": "moi_burn_duration_min",    "lb": 1.0,         "ub": 90.0},           # Phase 3 retro burn
+    {"name": "launch_epoch_jd",   "lb": 2_461_270.5, "ub": 2_461_410.5},
+    {"name": "tof_days",          "lb": 130.0,        "ub": 300.0},
+    {"name": "thrust_newtons",    "lb": 50_000.0,     "ub": 500_000.0},
+    {"name": "m_struct_kg",       "lb": 2_000.0,      "ub": 15_000.0},
+    {"name": "moi_fuel_fraction", "lb": 0.10,         "ub": 0.55},
+    {"name": "total_fuel_kg",     "lb": 5_000.0,      "ub": 150_000.0},
+    {"name": "leo_coast_days",    "lb": 0.0,          "ub": 1.0},
 ]
 
-N_VAR = len(DESIGN_VARIABLE_SPEC)
+N_VAR        = len(DESIGN_VARIABLE_SPEC)
 LOWER_BOUNDS = np.array([s["lb"] for s in DESIGN_VARIABLE_SPEC])
 UPPER_BOUNDS = np.array([s["ub"] for s in DESIGN_VARIABLE_SPEC])
 
-# Named index constants — import these in problem.py / runner.py
-IDX_EPOCH        = 0
-IDX_COAST        = 1
-IDX_ANGLE        = 2
-IDX_BURN_DUR     = 3
-IDX_THRUST       = 4
-IDX_TOTAL_MASS   = 5
-IDX_FUEL_MASS    = 6
-IDX_STAGE_MASS   = 7
-IDX_MOI_DUR      = 8
+IDX_EPOCH    = 0
+IDX_TOF      = 1
+IDX_THRUST   = 2
+IDX_STRUCT   = 3
+IDX_MOI_FRAC = 4
+IDX_FUEL     = 5
+IDX_COAST    = 6
+
+# Known-good (epoch_jd, tof_days) anchor points confirmed from Lambert scan
+KNOWN_GOOD_ANCHORS: list[tuple[float, float]] = [
+    (2_461_294.5, 250.0),   # 2026-09-11, 250d  dV=8.77 km/s
+    (2_461_314.5, 250.0),   # 2026-10-01, 250d  dV=8.22 km/s
+    (2_461_314.5, 200.0),   # 2026-10-01, 200d  dV=11.82 km/s
+    (2_461_335.5, 200.0),   # 2026-10-22, 200d  dV=9.47 km/s
+    (2_461_370.5, 210.0),   # 2026-11-26, 210d  dV=7.18 km/s
+]
 
 
 # ---------------------------------------------------------------------------
-# Rounding precision for cache keys
+# Vehicle mass derivation
 # ---------------------------------------------------------------------------
-_CACHE_DECIMALS = 4   # round to 4 decimal places before hashing
 
+def derive_masses(x: np.ndarray, propellant: Propellant) -> dict:
+    """
+    Derive Phase 2/3 mass inputs from design vector.
+
+    Layout
+    ------
+    total_fuel   = tmi_fuel + moi_fuel
+    moi_fuel     = total_fuel × moi_fuel_fraction
+    tmi_fuel     = total_fuel × (1 − moi_fuel_fraction)
+    m_remaining  = m_struct + moi_fuel          (kept after stage sep)
+    m_wet        = m_remaining + tmi_fuel + BUFFER
+                                                (BUFFER ensures strict < constraint)
+    """
+    thrust     = float(x[IDX_THRUST])
+    m_struct   = float(x[IDX_STRUCT])
+    moi_frac   = float(x[IDX_MOI_FRAC])
+    total_fuel = float(x[IDX_FUEL])
+
+    moi_fuel   = total_fuel * moi_frac
+    tmi_fuel   = total_fuel * (1.0 - moi_frac)
+    m_remaining = m_struct + moi_fuel
+    m_wet       = m_remaining + tmi_fuel + MASS_BUFFER_KG
+
+    rate       = burn_rate_kg_per_min(propellant, thrust)
+    burn_dur_s = (tmi_fuel / (rate / 60.0)) if rate > 0 else 0.0
+
+    return {
+        "tmi_fuel":         tmi_fuel,
+        "moi_fuel":         moi_fuel,
+        "m_wet":            m_wet,
+        "m_remaining":      m_remaining,
+        "burn_rate_kg_min": rate,
+        "burn_dur_s":       burn_dur_s,
+        "burn_dur_min":     burn_dur_s / 60.0,
+    }
+
+
+def check_masses(m: dict) -> str | None:
+    """Return an error string if Part2 mass constraints are violated, else None."""
+    if m["tmi_fuel"] <= 0 or m["moi_fuel"] <= 0:
+        return "fuel components must be positive"
+    if m["burn_rate_kg_min"] <= 0:
+        return "burn_rate is zero (thrust or Isp is zero)"
+    non_tmi = m["m_wet"] - m["tmi_fuel"]
+    if m["m_remaining"] >= non_tmi:
+        return f"remaining ({m['m_remaining']:.1f}) >= non_tmi ({non_tmi:.1f})"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Launch angle
+# ---------------------------------------------------------------------------
+
+def compute_launch_angle(epoch_jd: float, tof_days: float, burn_dur_s: float) -> float:
+    """
+    Parking-orbit launch angle [deg] so the burn midpoint aligns with the
+    Lambert departure v_inf direction.  Returns 0.0 on failure.
+
+    Formula
+    -------
+    lambert_angle = arctan2(−v_inf_x, v_inf_y)   mod 360
+    burn_arc_deg  = (burn_dur_s / LEO_PERIOD_S) × 360
+    launch_angle  = lambert_angle − burn_arc_deg / 2   mod 360
+    """
+    try:
+        dep = Time(epoch_jd, format="jd", scale="tdb")
+        arr = dep + tof_days * u.day
+        r_earth, v_earth = get_heliocentric_state("earth", dep)
+        r_mars,  _       = get_heliocentric_state("mars",  arr)
+        v1, _ = _lambert_universal(MU_SUN, r_earth, r_mars, tof_days * 86_400.0)
+        v_inf = (v1 - v_earth)[:2]
+        n = np.linalg.norm(v_inf)
+        if n < 1e-9:
+            return 0.0
+        d = v_inf / n
+        lambert_angle = np.degrees(np.arctan2(-d[0], d[1])) % 360.0
+        burn_arc_deg  = (burn_dur_s / LEO_PERIOD_S) * 360.0
+        return (lambert_angle - burn_arc_deg / 2.0) % 360.0
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Phase settings builders
+# ---------------------------------------------------------------------------
+
+def build_phase_settings(
+    x: np.ndarray,
+    masses: dict,
+    propellant: Propellant,
+    launch_angle: float,
+    start_utc: str,
+    p1_dt_s: float,
+    p2_dt_s: float,
+    p3_dt_s: float,
+    p2_total_days: float,
+    p3_total_days: float,
+    stage_sep_speed_m_s: float,
+    phase3_lead_hours: float,
+    moi_thrust_fraction: float,
+) -> tuple[dict, dict, dict]:
+
+    p1 = {
+        "launch_altitude_km":        LEO_ALT_KM,
+        "initial_velocity_km_s":     None,
+        "launch_angle_deg":          launch_angle,
+        "simulation_start_time_utc": start_utc,
+        "dt_seconds":                p1_dt_s,
+        "max_step_seconds":          min(30.0, p1_dt_s),
+        "total_time_days":           float(x[IDX_COAST]),
+    }
+    p2 = {
+        "requested_burn_duration_minutes": masses["burn_dur_min"],
+        "thrust_newtons":                  float(x[IDX_THRUST]),
+        "initial_total_mass_kg":           masses["m_wet"],
+        "burn_rate_kg_per_min":            masses["burn_rate_kg_min"],
+        "starting_fuel_mass_kg":           masses["tmi_fuel"],
+        "remaining_stage_mass_kg":         masses["m_remaining"],
+        "stage_separation_relative_speed_m_s": stage_sep_speed_m_s,
+        "phase3_collision_lead_hours":     phase3_lead_hours,
+        "dt_seconds":                      p2_dt_s,
+        "max_step_seconds":                min(60.0, p2_dt_s),
+        "total_time_days":                 p2_total_days,
+    }
+    p3 = {
+        "correction_fuel_mass_kg":             masses["moi_fuel"],
+        "thrust_newtons":                      float(x[IDX_THRUST]) * moi_thrust_fraction,
+        "collision_conversion_burn_duration_minutes": 30.0,
+        "requested_burn_duration_minutes":     60.0,
+        "dt_seconds":                          p3_dt_s,
+        "max_step_seconds":                    min(30.0, p3_dt_s),
+        "total_time_days":                     p3_total_days,
+    }
+    return p1, p2, p3
+
+
+# ---------------------------------------------------------------------------
+# ObjectiveFunction
+# ---------------------------------------------------------------------------
 
 class ObjectiveFunction:
     """
-    Wraps the three-phase simulator as a callable objective function.
+    Wraps the three-phase N-body simulator as a callable objective.
 
-    Instantiate one per propellant.  Call evaluate(x) to get the result dict,
-    or use the three scalar helpers (tof_obj, fuel_obj, cost_obj) that the
-    pymoo Problem subclass can call directly.
+    One instance per propellant.  Instances are picklable for multiprocessing.
 
     Parameters
     ----------
-    propellant            : Propellant
-    payload_mass_kg       : payload mass delivered to Mars orbit [kg]
-    structural_mass_kg    : structural / hardware mass of the propulsion stage [kg]
-                            Used only for the cost model CER; does not feed into
-                            the simulator (which uses remaining_stage_mass_kg).
-    stage_sep_speed_m_s   : stage-separation ejection speed [m/s]
-    phase3_lead_hours     : collision-course lead time for phase-3 handoff [h]
-    p1_dt_s               : Phase 1 output timestep [s]  (smaller = slower but finer)
-    p2_dt_s               : Phase 2 output timestep [s]
-    p3_dt_s               : Phase 3 output timestep [s]
-    p2_total_days         : Phase 2 max simulation duration [days]
-    p3_total_days         : Phase 3 max simulation duration [days]
+    propellant           : Propellant
+    stage_sep_speed_m_s  : stage-separation ejection speed [m/s]
+    phase3_lead_hours    : collision-course lead time for Phase-3 handoff [h]
+    moi_thrust_fraction  : MOI thruster force as fraction of TMI engine thrust
+    p1/2/3_dt_s          : output timestep per phase [s]
+    p2_total_days        : Phase 2 max duration [days]  (TOF + 60-day buffer)
+    p3_total_days        : Phase 3 observation window [days]
     """
 
     def __init__(
         self,
         propellant: Propellant,
-        payload_mass_kg: float = 5_000.0,
-        structural_mass_kg: float = 8_000.0,
-        stage_sep_speed_m_s: float = 50.0,
-        phase3_lead_hours: float = 10.0,
-        p1_dt_s: float = 180.0,
-        p2_dt_s: float = 180.0,
-        p3_dt_s: float = 180.0,
-        p2_total_days: float = 300.0,
-        p3_total_days: float = 10.0,
+        stage_sep_speed_m_s: float  = 50.0,
+        phase3_lead_hours: float    = 10.0,
+        moi_thrust_fraction: float  = 0.05,
+        p1_dt_s: float              = 300.0,
+        p2_dt_s: float              = 300.0,
+        p3_dt_s: float              = 300.0,
+        p2_total_days: float        = 380.0,
+        p3_total_days: float        = 90.0,
     ):
         self.propellant          = propellant
-        self.payload_mass_kg     = payload_mass_kg
-        self.structural_mass_kg  = structural_mass_kg
         self.stage_sep_speed_m_s = stage_sep_speed_m_s
         self.phase3_lead_hours   = phase3_lead_hours
+        self.moi_thrust_fraction = moi_thrust_fraction
         self.p1_dt_s             = p1_dt_s
         self.p2_dt_s             = p2_dt_s
         self.p3_dt_s             = p3_dt_s
         self.p2_total_days       = p2_total_days
         self.p3_total_days       = p3_total_days
-
-        # Per-instance cache: rounded x tuple -> result dict
         self._cache: dict[tuple, dict] = {}
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    # ── public ───────────────────────────────────────────────────────────────
 
     def evaluate(self, x: np.ndarray) -> dict:
         """
-        Run the full three-phase simulation for design vector x.
-
-        Returns a result dict with keys:
-            tof_days      : total mission duration [days]
-            fuel_kg       : total propellant consumed [kg]
-            cost_usd      : total mission cost [USD]
-            feasible      : bool — True if a stable Mars orbit was achieved
-            p1_result     : raw Phase 1 output dict
-            p2_result     : raw Phase 2 output dict
-            p3_result     : raw Phase 3 output dict
-            status        : human-readable outcome string
+        Run all three phases and return a result dict:
+            tof_days, fuel_kg, cost_usd, feasible, status,
+            p1_result, p2_result, p3_result
         """
-        key = self._cache_key(x)
+        key = tuple(np.round(x, 4))
         if key in self._cache:
             return self._cache[key]
-
-        result = self._run(x)
-        self._cache[key] = result
-        return result
+        r = self._run(x)
+        self._cache[key] = r
+        return r
 
     def objectives(self, x: np.ndarray) -> tuple[float, float, float]:
-        """
-        Return (tof_days, fuel_kg, cost_usd/1e6) for design vector x.
-
-        Infeasible runs return (BIG, BIG, BIG).
-        This is the tuple pymoo's _evaluate method should unpack into F.
-        """
+        """(tof_days, fuel_kg, cost_usd/1e6).  Returns (BIG, BIG, BIG) if infeasible."""
         r = self.evaluate(x)
         if not r["feasible"]:
             return BIG, BIG, BIG
         return r["tof_days"], r["fuel_kg"], r["cost_usd"] / 1e6
 
     def feasibility_violation(self, x: np.ndarray) -> float:
-        """
-        Return a scalar constraint value:  <= 0 means feasible.
+        """pymoo G convention: -1.0 = feasible (G ≤ 0), +1.0 = infeasible (G > 0)."""
+        return -1.0 if self.evaluate(x)["feasible"] else 1.0
 
-        pymoo convention: G <= 0 is satisfied.
-        We return -1.0 for feasible runs and +1.0 for infeasible ones.
-        """
-        r = self.evaluate(x)
-        return -1.0 if r["feasible"] else 1.0
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _cache_key(self, x: np.ndarray) -> tuple:
-        return tuple(np.round(x, _CACHE_DECIMALS))
-
-    def _unpack(self, x: np.ndarray) -> dict:
-        """Unpack design vector into named values."""
-        return {
-            "launch_epoch_jd":         float(x[IDX_EPOCH]),
-            "leo_coast_days":          float(x[IDX_COAST]),
-            "launch_angle_deg":        float(x[IDX_ANGLE]),
-            "burn_duration_min":       float(x[IDX_BURN_DUR]),
-            "thrust_newtons":          float(x[IDX_THRUST]),
-            "initial_total_mass_kg":   float(x[IDX_TOTAL_MASS]),
-            "starting_fuel_mass_kg":   float(x[IDX_FUEL_MASS]),
-            "remaining_stage_mass_kg": float(x[IDX_STAGE_MASS]),
-            "moi_burn_duration_min":   float(x[IDX_MOI_DUR]),
-        }
-
-    def _epoch_to_utc_string(self, jd: float) -> str:
-        """Convert a Julian Date float to an ISO UTC string for astropy."""
-        return Time(jd, format="jd", scale="utc").isot
-
-    def _build_phase_settings(self, v: dict) -> tuple[dict, dict, dict]:
-        """
-        Build the three settings dicts that Transfer_Simulator expects.
-
-        The burn_rate is derived from propellant Isp and thrust so it is
-        never an independent design variable.
-        """
-        start_utc = self._epoch_to_utc_string(v["launch_epoch_jd"])
-        rate = burn_rate_kg_per_min(self.propellant, v["thrust_newtons"])
-
-        phase1 = {
-            "launch_altitude_km":         200.0,          # fixed LEO altitude
-            "initial_velocity_km_s":      None,            # auto circular speed
-            "launch_angle_deg":           v["launch_angle_deg"],
-            "simulation_start_time_utc":  start_utc,
-            "dt_seconds":                 self.p1_dt_s,
-            "max_step_seconds":           min(30.0, self.p1_dt_s),
-            "total_time_days":            v["leo_coast_days"],
-        }
-
-        phase2 = {
-            "requested_burn_duration_minutes": v["burn_duration_min"],
-            "thrust_newtons":                  v["thrust_newtons"],
-            "initial_total_mass_kg":           v["initial_total_mass_kg"],
-            "burn_rate_kg_per_min":            rate,
-            "starting_fuel_mass_kg":           v["starting_fuel_mass_kg"],
-            "remaining_stage_mass_kg":         v["remaining_stage_mass_kg"],
-            "stage_separation_relative_speed_m_s": self.stage_sep_speed_m_s,
-            "phase3_collision_lead_hours":     self.phase3_lead_hours,
-            "dt_seconds":                      self.p2_dt_s,
-            "max_step_seconds":                min(60.0, self.p2_dt_s),
-            "total_time_days":                 self.p2_total_days,
-        }
-
-        phase3 = {
-            "correction_fuel_mass_kg":              0.0,   # all fuel already in phase2 budget
-            "thrust_newtons":                       v["thrust_newtons"] * 0.05,  # 5 % for correction thrusters
-            "collision_conversion_burn_duration_minutes": v["moi_burn_duration_min"],
-            "requested_burn_duration_minutes":      v["moi_burn_duration_min"],
-            "dt_seconds":                           self.p3_dt_s,
-            "max_step_seconds":                     min(30.0, self.p3_dt_s),
-            "total_time_days":                      self.p3_total_days,
-        }
-
-        return phase1, phase2, phase3
-
-    def _validate_mass_constraints(self, v: dict) -> str | None:
-        """
-        Pre-check physical mass constraints before running the simulator.
-        Returns an error string if invalid, None otherwise.
-
-        Mirrors Part2's validate_mass_inputs but allows early exit.
-        """
-        if v["starting_fuel_mass_kg"] > v["initial_total_mass_kg"]:
-            return "starting_fuel_mass_kg > initial_total_mass_kg"
-        non_fuel = v["initial_total_mass_kg"] - v["starting_fuel_mass_kg"]
-        if v["remaining_stage_mass_kg"] > non_fuel:
-            return "remaining_stage_mass_kg > non-fuel mass"
-        if v["remaining_stage_mass_kg"] <= 0:
-            return "remaining_stage_mass_kg must be positive"
-        return None
-
-    def _extract_objectives(
-        self,
-        v: dict,
-        p1_result: dict,
-        p2_result: dict,
-        p3_result: dict,
-    ) -> tuple[float, float, float, bool, str]:
-        """
-        Pull tof, fuel, cost, and feasibility out of the three phase results.
-
-        Returns
-        -------
-        tof_days    : total elapsed time across all three phases
-        fuel_kg     : total propellant consumed (Phase 2 burn + Phase 3 retro)
-        cost_usd    : estimated mission cost
-        feasible    : True if Phase 3 detected a stable Mars orbit
-        status      : human-readable outcome
-        """
-        p1_fs = p1_result["phase1_final_state"]
-        p2_fs = p2_result["phase2_simulation"]["final_state"]
-        p3_fs = p3_result["phase3_final_state"]
-
-        # Total mission time [days]
-        tof_days = (
-            p1_fs["elapsed_time_seconds"]
-            + p2_fs["elapsed_time_seconds"]
-            + p3_fs["elapsed_time_seconds"]
-        ) / 86_400.0
-
-        # Fuel consumed:
-        #   Phase 2 burn fuel = starting_fuel - fuel_remaining_after_phase2_burn
-        #   Phase 3 retro fuel = whatever phase3 burned (tracked in its final state)
-        # The simplest accounting: total_initial - final_rocket_mass,
-        # but that includes discarded stage hardware.  So we track fuel explicitly.
-        p2_fuel_burned = v["starting_fuel_mass_kg"] - p2_fs["fuel_remaining_kg"]
-        p3_fuel_burned = max(
-            0.0,
-            p3_fs.get("rocket_mass_kg", 0.0)   # phase3 sets correction_fuel -> 0 by design
-        )
-        # Since we set correction_fuel_mass_kg=0 in phase3, p3 fuel burn is 0
-        # in our setup (MOI is handled by phase2 burn duration).
-        # If your team later separates MOI fuel, update this line.
-        fuel_kg = p2_fuel_burned
-
-        # Cost model
-        cost = estimate_cost(
-            propellant=self.propellant,
-            m_prop_consumed_kg=fuel_kg,
-            structural_mass_kg=self.structural_mass_kg,
-            initial_wet_mass_kg=v["initial_total_mass_kg"],
-        )
-
-        # Feasibility: Phase 3 must confirm a stable orbit
-        feasible = bool(p3_fs.get("stable_orbit_detected", False))
-        status = p3_fs.get("status", "unknown")
-
-        return tof_days, fuel_kg, cost.total, feasible, status
+    # ── private ──────────────────────────────────────────────────────────────
 
     def _run(self, x: np.ndarray) -> dict:
-        """Execute all three phases and return the unified result dict."""
-        v = self._unpack(x)
+        masses = derive_masses(x, self.propellant)
+        err = check_masses(masses)
+        if err:
+            return self._penalty(f"mass: {err}")
 
-        # --- Pre-flight mass checks ---
-        mass_error = self._validate_mass_constraints(v)
-        if mass_error:
-            return self._penalty_result(f"mass constraint: {mass_error}")
+        epoch_jd = float(x[IDX_EPOCH])
+        tof_days = float(x[IDX_TOF])
+        angle    = compute_launch_angle(epoch_jd, tof_days, masses["burn_dur_s"])
+        utc      = Time(epoch_jd, format="jd", scale="tdb").utc.isot
+        p2_days  = min(tof_days + 60.0, self.p2_total_days)
 
-        phase1_settings, phase2_settings, phase3_settings = self._build_phase_settings(v)
+        p1s, p2s, p3s = build_phase_settings(
+            x, masses, self.propellant, angle, utc,
+            self.p1_dt_s, self.p2_dt_s, self.p3_dt_s,
+            p2_days, self.p3_total_days,
+            self.stage_sep_speed_m_s, self.phase3_lead_hours,
+            self.moi_thrust_fraction,
+        )
 
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-
-                p1_result = run_phase1(
-                    phase1_settings=phase1_settings,
-                    run_animation=False,
+                p1r = run_phase1(phase1_settings=p1s, run_animation=False)
+                p2r = run_phase2(
+                    phase1_final_state=p1r["phase1_final_state"],
+                    phase2_settings=p2s, run_animation=False,
                 )
-                p2_result = run_phase2(
-                    phase1_final_state=p1_result["phase1_final_state"],
-                    phase2_settings=phase2_settings,
-                    run_animation=False,
+                p3r = run_phase3(
+                    phase2_handoff_state=p2r["phase3_handoff_state"],
+                    phase3_settings=p3s, run_animation=False,
                 )
-                p3_result = run_phase3(
-                    phase2_handoff_state=p2_result["phase3_handoff_state"],
-                    phase3_settings=phase3_settings,
-                    run_animation=False,
-                )
-
         except Exception as exc:
-            return self._penalty_result(f"simulator exception: {exc}")
+            return self._penalty(f"simulator: {exc}")
 
-        tof_days, fuel_kg, cost_usd, feasible, status = self._extract_objectives(
-            v, p1_result, p2_result, p3_result
+        return self._extract(x, masses, p1r, p2r, p3r)
+
+    def _extract(self, x, masses, p1r, p2r, p3r) -> dict:
+        p1fs = p1r["phase1_final_state"]
+        p2fs = p2r["phase2_simulation"]["final_state"]
+        p3fs = p3r["phase3_final_state"]
+
+        tof_days = (
+            p1fs["elapsed_time_seconds"]
+            + p2fs["elapsed_time_seconds"]
+            + p3fs["elapsed_time_seconds"]
+        ) / 86_400.0
+
+        tmi_burned = masses["tmi_fuel"] - p2fs["fuel_remaining_kg"]
+        moi_burned = masses["moi_fuel"] - p3fs["fuel_remaining_kg"]
+        fuel_kg    = max(0.0, tmi_burned) + max(0.0, moi_burned)
+
+        cost = estimate_cost(
+            propellant          = self.propellant,
+            m_prop_consumed_kg  = fuel_kg,
+            structural_mass_kg  = float(x[IDX_STRUCT]),
+            initial_wet_mass_kg = masses["m_wet"],
         )
 
         return {
-            "tof_days":   tof_days,
-            "fuel_kg":    fuel_kg,
-            "cost_usd":   cost_usd,
-            "feasible":   feasible,
-            "status":     status,
-            "p1_result":  p1_result,
-            "p2_result":  p2_result,
-            "p3_result":  p3_result,
+            "tof_days":  tof_days,
+            "fuel_kg":   fuel_kg,
+            "cost_usd":  cost.total,
+            "feasible":  bool(p3fs.get("stable_orbit_detected", False)),
+            "status":    p3fs.get("status", "unknown"),
+            "p1_result": p1r,
+            "p2_result": p2r,
+            "p3_result": p3r,
         }
 
     @staticmethod
-    def _penalty_result(reason: str) -> dict:
+    def _penalty(reason: str) -> dict:
         return {
-            "tof_days":   BIG,
-            "fuel_kg":    BIG,
-            "cost_usd":   BIG,
-            "feasible":   False,
-            "status":     reason,
-            "p1_result":  None,
-            "p2_result":  None,
-            "p3_result":  None,
+            "tof_days": BIG, "fuel_kg": BIG, "cost_usd": BIG,
+            "feasible": False, "status": reason,
+            "p1_result": None, "p2_result": None, "p3_result": None,
         }
 
 
 # ---------------------------------------------------------------------------
-# Convenience: sweep all propellants and return a dict of ObjectiveFunctions
+# Seeder
 # ---------------------------------------------------------------------------
 
-def build_objective_functions(**kwargs) -> dict[str, ObjectiveFunction]:
+def generate_seeds(
+    propellant: Propellant,
+    n_seeds: int = 20,
+    rng_seed: int = 0,
+) -> np.ndarray:
     """
-    Instantiate one ObjectiveFunction per propellant in the catalogue.
+    Generate warm-start design vectors from the confirmed Lambert anchor points.
 
-    Any keyword arguments are forwarded to ObjectiveFunction.__init__,
-    allowing the caller to set payload_mass_kg, timesteps, etc. once.
+    For each of the five known-good (epoch, TOF) pairs:
+    - Size the vehicle to exactly deliver the Lambert dV budget.
+    - Add random variation in thrust, m_struct, and a fuel margin (10–40 %)
+      so seeds span a range of the objective space.
+    - Jitter epoch and TOF slightly around each anchor.
+
+    Pads with uniform-random samples if fewer than n_seeds survive mass checks.
 
     Returns
     -------
-    dict keyed by propellant key, e.g. {"kerolox": obj_fn, ...}
+    np.ndarray of shape (n_seeds, N_VAR), within bounds.
     """
-    return {
-        key: ObjectiveFunction(propellant=prop, **kwargs)
-        for key, prop in PROPELLANTS.items()
-    }
+    rng = np.random.default_rng(rng_seed)
+    Isp = propellant.isp_vac_s
+
+    seeds: list[np.ndarray] = []
+
+    # How many variants to generate per anchor
+    variants_per_anchor = max(1, n_seeds // len(KNOWN_GOOD_ANCHORS) + 2)
+
+    for jd_anchor, tof_anchor in KNOWN_GOOD_ANCHORS:
+        dep = Time(jd_anchor, format="jd", scale="tdb")
+
+        try:
+            r = solve_lambert(dep, tof_anchor)
+        except Exception:
+            continue
+
+        dv_tmi, dv_moi = r["dv_tmi"], r["dv_moi"]
+        if not (0 < dv_tmi < 20 and 0 < dv_moi < 20):
+            continue
+
+        for _ in range(variants_per_anchor):
+            # Random vehicle parameters
+            m_struct = rng.uniform(LOWER_BOUNDS[IDX_STRUCT],
+                                   min(12_000.0, UPPER_BOUNDS[IDX_STRUCT]))
+            thrust   = rng.uniform(LOWER_BOUNDS[IDX_THRUST],
+                                   min(400_000.0, UPPER_BOUNDS[IDX_THRUST]))
+
+            # Minimum fuel to deliver the exact Lambert dV budget
+            moi_min     = m_struct * (np.exp(dv_moi / (Isp * G0_KM_S2)) - 1.0)
+            m_after_tmi = m_struct + moi_min
+            tmi_min     = m_after_tmi * (np.exp(dv_tmi / (Isp * G0_KM_S2)) - 1.0)
+            total_min   = tmi_min + moi_min
+
+            if total_min <= 0 or not np.isfinite(total_min):
+                continue
+
+            # Random margin gives objective-space diversity
+            margin     = rng.uniform(1.10, 1.40)
+            total_fuel = np.clip(total_min * margin,
+                                 LOWER_BOUNDS[IDX_FUEL], UPPER_BOUNDS[IDX_FUEL])
+
+            # Natural MOI fraction with small jitter
+            moi_frac = np.clip(
+                moi_min / total_min + rng.uniform(-0.03, 0.03),
+                LOWER_BOUNDS[IDX_MOI_FRAC], UPPER_BOUNDS[IDX_MOI_FRAC],
+            )
+
+            # Small epoch/TOF jitter around the anchor
+            jd  = np.clip(jd_anchor  + rng.uniform(-5.0, 5.0),
+                          LOWER_BOUNDS[IDX_EPOCH], UPPER_BOUNDS[IDX_EPOCH])
+            tof = np.clip(tof_anchor + rng.uniform(-10.0, 10.0),
+                          LOWER_BOUNDS[IDX_TOF], UPPER_BOUNDS[IDX_TOF])
+
+            x = np.array([
+                jd, tof, thrust, m_struct, moi_frac, total_fuel,
+                rng.uniform(0.0, 0.5),
+            ])
+            x = np.clip(x, LOWER_BOUNDS, UPPER_BOUNDS)
+
+            # Quick mass sanity check before adding
+            m = derive_masses(x, propellant)
+            if check_masses(m) is None:
+                seeds.append(x)
+
+    # Pad with uniform-random samples
+    while len(seeds) < n_seeds:
+        x = rng.uniform(LOWER_BOUNDS, UPPER_BOUNDS)
+        seeds.append(np.clip(x, LOWER_BOUNDS, UPPER_BOUNDS))
+
+    return np.array(seeds[:n_seeds])
+
+
+# ---------------------------------------------------------------------------
+# Convenience factory
+# ---------------------------------------------------------------------------
+
+def build_objective_functions(**kwargs) -> dict[str, ObjectiveFunction]:
+    """One ObjectiveFunction per propellant. kwargs → ObjectiveFunction.__init__."""
+    return {k: ObjectiveFunction(propellant=p, **kwargs) for k, p in PROPELLANTS.items()}
