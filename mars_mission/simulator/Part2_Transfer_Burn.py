@@ -75,7 +75,7 @@ PHASE2_INPUTS = {
     "stage_separation_relative_speed_m_s": 50.0,
     "phase3_collision_lead_hours": 4.0,
     "dt_seconds": 60.0,
-    "max_step_seconds": 60.0,
+    "max_step_seconds": 3600.0,
     "total_time_days": 180.0,
     "playback_speed": 5.0,
     "fps": 60,
@@ -529,6 +529,8 @@ def simulate_transfer_burn_phase2(
     dt_seconds=PHASE2_INPUTS["dt_seconds"],
     max_step_seconds=PHASE2_INPUTS["max_step_seconds"],
     total_time_days=PHASE2_INPUTS["total_time_days"],
+    adaptive_steps=True,
+    close_approach_radius_km=500_000.0,
 ):
     """
     Simulate phase 2 as a Sun-centered transfer with a finite burn.
@@ -613,7 +615,25 @@ def simulate_transfer_burn_phase2(
 
         while interval_elapsed < interval_seconds - 1e-12:
             remaining_interval_seconds = interval_seconds - interval_elapsed
-            step_seconds = min(max_step_seconds, remaining_interval_seconds)
+            if adaptive_steps:
+                # Use the previous iteration's distances (already computed below)
+                # On the very first substep of each output interval we don't have
+                # them yet, so we interpolate planet positions at alpha_start=0.
+                _earth_x_now = lerp(earth_x_km[i], earth_x_km[i + 1], interval_elapsed / interval_seconds)
+                _earth_y_now = lerp(earth_y_km[i], earth_y_km[i + 1], interval_elapsed / interval_seconds)
+                _mars_x_now  = lerp(mars_x_km[i],  mars_x_km[i + 1],  interval_elapsed / interval_seconds)
+                _mars_y_now  = lerp(mars_y_km[i],  mars_y_km[i + 1],  interval_elapsed / interval_seconds)
+                _d_earth = np.hypot(state[0] - _earth_x_now, state[1] - _earth_y_now)
+                _d_mars  = np.hypot(state[0] - _mars_x_now,  state[1] - _mars_y_now)
+                _min_dist = min(_d_earth, _d_mars)
+                # Scale max step linearly: full max_step_seconds when far away,
+                # down to max_step_seconds/20 when within close_approach_radius_km.
+                # This gives fine resolution near planets and coarse resolution in cruise.
+                _proximity = max(0.0, min(1.0, _min_dist / close_approach_radius_km))
+                _adaptive_max = max_step_seconds * (0.05 + 0.95 * _proximity)
+                step_seconds = min(_adaptive_max, remaining_interval_seconds)
+            else:
+                step_seconds = min(max_step_seconds, remaining_interval_seconds)
 
             burn_active = burn_elapsed_seconds < actual_burn_duration_seconds - 1e-12
             if burn_active:
@@ -850,6 +870,8 @@ def animate_transfer_burn_phase2(
     total_time_days=PHASE2_INPUTS["total_time_days"],
     playback_speed=PHASE2_INPUTS["playback_speed"],
     fps=PHASE2_INPUTS["fps"],
+    adaptive_steps=True,
+    close_approach_radius_km=500_000.0,
 ):
     """Animate the Sun-centered transfer burn and return the simulation results."""
     simulation = simulate_transfer_burn_phase2(
@@ -864,6 +886,8 @@ def animate_transfer_burn_phase2(
         dt_seconds=dt_seconds,
         max_step_seconds=max_step_seconds,
         total_time_days=total_time_days,
+        adaptive_steps=adaptive_steps,
+        close_approach_radius_km=close_approach_radius_km,
     )
 
     t_seconds = simulation["t_seconds"]

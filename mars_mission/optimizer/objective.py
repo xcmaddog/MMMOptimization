@@ -66,6 +66,7 @@ from mars_transfer.trajectory.lambert import _lambert_universal, MU_SUN, solve_l
 
 from optimizer.propellants import Propellant, PROPELLANTS, burn_rate_kg_per_min
 from cost.cost import estimate_cost
+from optimizer.cache import EvalCache, get_default_cache, DEFAULT_CACHE_PATH
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -78,6 +79,11 @@ LEO_PERIOD_S = 2.0 * np.pi * np.sqrt(LEO_R_KM**3 / EARTH_MU_KM)
 MASS_BUFFER_KG = 200.0
 BIG = 1e9
 
+# Earth-escape delta-v from 200 km LEO (Oberth-effect lower bound).
+# Any design that cannot meet this analytically is rejected before the simulator runs.
+_V_CIRC_LEO_KM_S = np.sqrt(EARTH_MU_KM / LEO_R_KM)
+_DV_LEO_ESCAPE_KM_S = (np.sqrt(2.0) - 1.0) * _V_CIRC_LEO_KM_S  # ≈ 3.22 km/s
+
 # ---------------------------------------------------------------------------
 # Design variable specification
 # ---------------------------------------------------------------------------
@@ -88,7 +94,7 @@ DESIGN_VARIABLE_SPEC: list[dict] = [
     {"name": "thrust_newtons",    "lb": 50_000.0,     "ub": 500_000.0},
     {"name": "m_struct_kg",       "lb": 2_000.0,      "ub": 15_000.0},
     {"name": "moi_fuel_fraction", "lb": 0.10,         "ub": 0.55},
-    {"name": "total_fuel_kg",     "lb": 5_000.0,      "ub": 150_000.0},
+    {"name": "total_fuel_kg",     "lb": 20_000.0,     "ub": 200_000.0},
     {"name": "leo_coast_days",    "lb": 0.0,          "ub": 1.0},
 ]
 
@@ -155,8 +161,14 @@ def derive_masses(x: np.ndarray, propellant: Propellant) -> dict:
     }
 
 
-def check_masses(m: dict) -> str | None:
-    """Return an error string if Part2 mass constraints are violated, else None."""
+def check_masses(m: dict, isp_vac_s: float | None = None) -> str | None:
+    """
+    Return an error string if Part2 mass constraints are violated, else None.
+
+    If isp_vac_s is supplied, also checks that the TMI burn delivers enough
+    delta-v to escape Earth from 200 km LEO.  This catches configurations
+    that would waste a full simulator run before re-impacting Earth.
+    """
     if m["tmi_fuel"] <= 0 or m["moi_fuel"] <= 0:
         return "fuel components must be positive"
     if m["burn_rate_kg_min"] <= 0:
@@ -164,6 +176,12 @@ def check_masses(m: dict) -> str | None:
     non_tmi = m["m_wet"] - m["tmi_fuel"]
     if m["m_remaining"] >= non_tmi:
         return f"remaining ({m['m_remaining']:.1f}) >= non_tmi ({non_tmi:.1f})"
+    if isp_vac_s is not None:
+        dv_tmi = isp_vac_s * G0_KM_S2 * np.log(m["m_wet"] / m["m_remaining"])
+        if dv_tmi < _DV_LEO_ESCAPE_KM_S:
+            return (
+                f"TMI dV={dv_tmi:.3f} km/s < escape dV={_DV_LEO_ESCAPE_KM_S:.3f} km/s"
+            )
     return None
 
 
@@ -239,8 +257,10 @@ def build_phase_settings(
         "stage_separation_relative_speed_m_s": stage_sep_speed_m_s,
         "phase3_collision_lead_hours":     phase3_lead_hours,
         "dt_seconds":                      p2_dt_s,
-        "max_step_seconds":                min(60.0, p2_dt_s),
+        "max_step_seconds":                p2_dt_s,   # adaptive steps handle near-planet accuracy
         "total_time_days":                 p2_total_days,
+        "adaptive_steps":                  True,
+        "close_approach_radius_km":        500_000.0,
     }
     p3 = {
         "correction_fuel_mass_kg":             masses["moi_fuel"],
@@ -286,6 +306,7 @@ class ObjectiveFunction:
         p3_dt_s: float              = 300.0,
         p2_total_days: float        = 380.0,
         p3_total_days: float        = 90.0,
+        cache_path: str | None      = DEFAULT_CACHE_PATH,
     ):
         self.propellant          = propellant
         self.stage_sep_speed_m_s = stage_sep_speed_m_s
@@ -297,6 +318,9 @@ class ObjectiveFunction:
         self.p2_total_days       = p2_total_days
         self.p3_total_days       = p3_total_days
         self._cache: dict[tuple, dict] = {}
+        self._disk_cache: EvalCache | None = (
+            EvalCache(cache_path) if cache_path else None
+        )
 
     # ── public ───────────────────────────────────────────────────────────────
 
@@ -305,12 +329,24 @@ class ObjectiveFunction:
         Run all three phases and return a result dict:
             tof_days, fuel_kg, cost_usd, feasible, status,
             p1_result, p2_result, p3_result
+
+        Checks in-memory cache first, then disk cache, then runs simulator.
         """
         key = tuple(np.round(x, 4))
+        # 1. In-memory cache (fastest — no disk I/O)
         if key in self._cache:
             return self._cache[key]
+        # 2. Disk cache (shared across workers and runs)
+        if self._disk_cache is not None:
+            cached = self._disk_cache.get(x, self.propellant.key)
+            if cached is not None:
+                self._cache[key] = cached
+                return cached
+        # 3. Run the simulator
         r = self._run(x)
         self._cache[key] = r
+        if self._disk_cache is not None:
+            self._disk_cache.put(x, self.propellant.key, r)
         return r
 
     def objectives(self, x: np.ndarray) -> tuple[float, float, float]:
@@ -328,7 +364,7 @@ class ObjectiveFunction:
 
     def _run(self, x: np.ndarray) -> dict:
         masses = derive_masses(x, self.propellant)
-        err = check_masses(masses)
+        err = check_masses(masses, isp_vac_s=self.propellant.isp_vac_s)
         if err:
             return self._penalty(f"mass: {err}")
 
@@ -490,7 +526,7 @@ def generate_seeds(
 
             # Quick mass sanity check before adding
             m = derive_masses(x, propellant)
-            if check_masses(m) is None:
+            if check_masses(m, isp_vac_s=propellant.isp_vac_s) is None:
                 seeds.append(x)
 
     # Pad with uniform-random samples

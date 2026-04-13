@@ -1,0 +1,2 @@
+solution,propellant,tof_days,fuel_kg,cost_MUSD,launch_epoch_jd,tof_days,thrust_newtons,m_struct_kg,moi_fuel_fraction,total_fuel_kg,leo_coast_days,departure_date
+1,storable,285.841,69382.9,199.741,2.46139e+06,134.93,319449,3859.28,0.169648,69399.2,0.910638,2026-12-19

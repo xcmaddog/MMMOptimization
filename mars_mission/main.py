@@ -48,6 +48,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 
 import matplotlib
@@ -56,6 +57,7 @@ import matplotlib.pyplot as plt
 
 from optimizer import (
     build_objective_functions, ObjectiveFunction,
+    DESIGN_VARIABLE_SPEC,
     run_single, run_all_propellants,
     merge_pareto_fronts, print_pareto_summary,
     PROPELLANTS, KNOWN_GOOD_ANCHORS,
@@ -85,6 +87,64 @@ def _print_design_space() -> None:
     for jd, tof in KNOWN_GOOD_ANCHORS:
         dep = Time(jd, format="jd", scale="tdb").iso[:10]
         print(f"  {dep}  TOF={tof:.0f}d")
+
+
+
+# ── Pareto reporting helpers ──────────────────────────────────────────────────
+
+_VAR_NAMES = [s["name"] for s in DESIGN_VARIABLE_SPEC]
+
+
+def _print_pareto_design_vars(F: "np.ndarray", X: "np.ndarray", labels: list[str]) -> None:
+    """Print a table of objectives + design variables for every Pareto solution."""
+    from astropy.time import Time
+    print()
+    print("Global Pareto Front — full design vectors")
+    print("=" * 100)
+    header = (
+        f"{'#':>3}  {'Propellant':12}  {'TOF[d]':>7}  {'Fuel[kg]':>10}  "
+        f"{'Cost[M$]':>9}  {'Epoch':>12}  {'tof_dv':>7}  {'Thrust[N]':>10}  "
+        f"{'Struct[kg]':>10}  {'MOI_frac':>8}  {'TFuel[kg]':>10}  {'Coast[d]':>8}"
+    )
+    print(header)
+    print("-" * 100)
+    for i, (f_row, x_row, lbl) in enumerate(zip(F, X, labels)):
+        tof_days, fuel_kg, cost_M = f_row
+        try:
+            dep_date = Time(float(x_row[0]), format="jd", scale="tdb").iso[:10]
+        except Exception:
+            dep_date = f"{x_row[0]:.1f}"
+        print(
+            f"{i+1:>3}  {lbl:12}  {tof_days:>7.1f}  {fuel_kg:>10,.0f}  "
+            f"{cost_M:>9.2f}  {dep_date:>12}  {x_row[1]:>7.1f}  {x_row[2]:>10.0f}  "
+            f"{x_row[3]:>10.0f}  {x_row[4]:>8.3f}  {x_row[5]:>10.0f}  {x_row[6]:>8.3f}"
+        )
+    print("=" * 100)
+
+
+def _save_pareto_csv(F: "np.ndarray", X: "np.ndarray", labels: list[str],
+                     out_dir: str) -> None:
+    """Save the Pareto front (objectives + design variables) to a CSV file."""
+    import csv as _csv
+    from astropy.time import Time
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "pareto_solutions.csv")
+    obj_names = ["tof_days", "fuel_kg", "cost_MUSD"]
+    with open(path, "w", newline="") as fh:
+        writer = _csv.writer(fh)
+        writer.writerow(["solution", "propellant"] + obj_names + _VAR_NAMES + ["departure_date"])
+        for i, (f_row, x_row, lbl) in enumerate(zip(F, X, labels)):
+            try:
+                dep = Time(float(x_row[0]), format="jd", scale="tdb").iso[:10]
+            except Exception:
+                dep = str(x_row[0])
+            writer.writerow(
+                [i + 1, lbl]
+                + [f"{v:.6g}" for v in f_row]
+                + [f"{v:.6g}" for v in x_row]
+                + [dep]
+            )
+    print(f"  Saved {path}")
 
 
 def main() -> None:
@@ -161,11 +221,12 @@ def main() -> None:
         fig = pareto_3d(gF, labels=g_labels, title="Global Pareto Front")
         _save(fig, "global_pareto_3d.png", args.out)
 
-        # Print departure-date distribution of feasible solutions
         print(f"\n{len(gF)} global Pareto solutions:")
         print(f"  TOF range  : {gF[:,0].min():.1f} – {gF[:,0].max():.1f} days")
         print(f"  Fuel range : {gF[:,1].min():,.0f} – {gF[:,1].max():,.0f} kg")
         print(f"  Cost range : ${gF[:,2].min():.1f} M – ${gF[:,2].max():.1f} M")
+        _print_pareto_design_vars(gF, gX, g_labels)
+        _save_pareto_csv(gF, gX, g_labels, args.out)
     else:
         print(
             "\nNo feasible solutions found.\n"

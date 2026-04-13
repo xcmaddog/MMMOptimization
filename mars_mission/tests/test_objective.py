@@ -18,6 +18,7 @@ from optimizer.propellants import (
     burn_rate_kg_per_min, effective_isp, delta_v_km_s, G0_M_S2,
 )
 from cost.cost import estimate_cost, MissionCost
+from optimizer.objective import build_phase_settings
 from optimizer import (
     ObjectiveFunction, generate_seeds, derive_masses, check_masses,
     compute_launch_angle,
@@ -389,3 +390,283 @@ class TestSeeder:
         for n in [5, 20, 50]:
             seeds = generate_seeds(hydrolox, n_seeds=n, rng_seed=0)
             assert len(seeds) == n
+
+
+# ---------------------------------------------------------------------------
+# Disk cache tests
+# ---------------------------------------------------------------------------
+
+class TestEvalCache:
+    """Tests for the SQLite-backed persistent evaluation cache."""
+
+    @pytest.fixture
+    def tmp_cache(self, tmp_path):
+        from optimizer.cache import EvalCache
+        return EvalCache(str(tmp_path / "test.db"))
+
+    @pytest.fixture
+    def sample_x(self):
+        x = np.zeros(N_VAR)
+        x[IDX_EPOCH]    = 2_461_314.5
+        x[IDX_TOF]      = 250.0
+        x[IDX_THRUST]   = 200_000.0
+        x[IDX_STRUCT]   = 5_000.0
+        x[IDX_MOI_FRAC] = 0.25
+        x[IDX_FUEL]     = 60_000.0
+        x[IDX_COAST]    = 0.5
+        return x
+
+    @pytest.fixture
+    def sample_result(self):
+        return {
+            "tof_days": 250.0, "fuel_kg": 45_000.0, "cost_usd": 1.2e8,
+            "feasible": True, "status": "completed",
+            "p1_result": None, "p2_result": None, "p3_result": None,
+        }
+
+    def test_miss_on_empty_cache(self, tmp_cache, sample_x):
+        assert tmp_cache.get(sample_x, "hydrolox") is None
+
+    def test_put_then_get(self, tmp_cache, sample_x, sample_result):
+        tmp_cache.put(sample_x, "hydrolox", sample_result)
+        hit = tmp_cache.get(sample_x, "hydrolox")
+        assert hit is not None
+        assert hit["feasible"] is True
+        assert abs(hit["tof_days"] - 250.0) < 1e-9
+        assert abs(hit["fuel_kg"] - 45_000.0) < 1e-6
+
+    def test_different_propellant_is_miss(self, tmp_cache, sample_x, sample_result):
+        tmp_cache.put(sample_x, "hydrolox", sample_result)
+        assert tmp_cache.get(sample_x, "kerolox") is None
+
+    def test_different_x_is_miss(self, tmp_cache, sample_x, sample_result):
+        tmp_cache.put(sample_x, "hydrolox", sample_result)
+        x2 = sample_x.copy()
+        x2[IDX_TOF] += 5.0
+        assert tmp_cache.get(x2, "hydrolox") is None
+
+    def test_duplicate_put_is_ignored(self, tmp_cache, sample_x, sample_result):
+        tmp_cache.put(sample_x, "hydrolox", sample_result)
+        # Second put with different values should not overwrite
+        r2 = dict(sample_result, tof_days=999.0)
+        tmp_cache.put(sample_x, "hydrolox", r2)
+        hit = tmp_cache.get(sample_x, "hydrolox")
+        assert abs(hit["tof_days"] - 250.0) < 1e-9   # original value preserved
+
+    def test_stats_counts(self, tmp_cache, sample_x, sample_result):
+        assert tmp_cache.stats()["total"] == 0
+        tmp_cache.put(sample_x, "hydrolox", sample_result)
+        s = tmp_cache.stats()
+        assert s["total"] == 1
+        assert s["feasible"] == 1
+
+    def test_infeasible_counted_separately(self, tmp_cache, sample_x):
+        infeasible = {
+            "tof_days": BIG, "fuel_kg": BIG, "cost_usd": BIG,
+            "feasible": False, "status": "miss",
+            "p1_result": None, "p2_result": None, "p3_result": None,
+        }
+        tmp_cache.put(sample_x, "hydrolox", infeasible)
+        s = tmp_cache.stats()
+        assert s["total"] == 1
+        assert s["feasible"] == 0
+
+    def test_clear_empties_cache(self, tmp_cache, sample_x, sample_result):
+        tmp_cache.put(sample_x, "hydrolox", sample_result)
+        tmp_cache.clear()
+        assert tmp_cache.stats()["total"] == 0
+        assert tmp_cache.get(sample_x, "hydrolox") is None
+
+    def test_rounding_matches_objective_function(self, tmp_cache, hydrolox, sample_x):
+        """Cache key rounding must match ObjectiveFunction.evaluate() rounding."""
+        obj = ObjectiveFunction(propellant=hydrolox, cache_path=None)
+        key_obj = tuple(np.round(sample_x, 4))
+        # Slightly jitter x within the rounding tolerance
+        x_jittered = sample_x.copy()
+        x_jittered[IDX_TOF] += 1e-5   # delta < 0.5 * 10^-4 → rounds to same
+        result = {"tof_days": 250.0, "fuel_kg": 40000.0, "cost_usd": 1e8,
+                  "feasible": False, "status": "test",
+                  "p1_result": None, "p2_result": None, "p3_result": None}
+        tmp_cache.put(sample_x, "hydrolox", result)
+        # Same rounded value → cache hit
+        hit = tmp_cache.get(x_jittered, "hydrolox")
+        assert hit is not None
+
+
+# ---------------------------------------------------------------------------
+# Adaptive step size tests
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveSteps:
+    """Tests that the adaptive step size logic is present and correct."""
+
+    def test_signature_has_adaptive_params(self):
+        import inspect
+        from simulator.Part2_Transfer_Burn import simulate_transfer_burn_phase2
+        sig = inspect.signature(simulate_transfer_burn_phase2)
+        assert "adaptive_steps" in sig.parameters
+        assert "close_approach_radius_km" in sig.parameters
+
+    def test_adaptive_steps_default_is_true(self):
+        import inspect
+        from simulator.Part2_Transfer_Burn import simulate_transfer_burn_phase2
+        sig = inspect.signature(simulate_transfer_burn_phase2)
+        assert sig.parameters["adaptive_steps"].default is True
+
+    def test_close_approach_radius_default(self):
+        import inspect
+        from simulator.Part2_Transfer_Burn import simulate_transfer_burn_phase2
+        sig = inspect.signature(simulate_transfer_burn_phase2)
+        default = sig.parameters["close_approach_radius_km"].default
+        assert default == 500_000.0
+
+    def test_phase2_settings_include_adaptive_flag(self, hydrolox, nominal_x):
+        """build_phase_settings must pass adaptive_steps to Phase 2."""
+        m = derive_masses(nominal_x, hydrolox)
+        angle = compute_launch_angle(
+            float(nominal_x[IDX_EPOCH]), float(nominal_x[IDX_TOF]), m["burn_dur_s"]
+        )
+        from astropy.time import Time
+        utc = Time(float(nominal_x[IDX_EPOCH]), format="jd", scale="tdb").utc.isot
+        _, p2, _ = build_phase_settings(
+            nominal_x, m, hydrolox, angle, utc,
+            300, 300, 300, 310, 90, 50, 10, 0.05,
+        )
+        assert p2.get("adaptive_steps") is True
+        assert "close_approach_radius_km" in p2
+
+
+# ---------------------------------------------------------------------------
+# ProgressCallback tests
+# ---------------------------------------------------------------------------
+
+class TestProgressCallback:
+    """Tests for the tqdm progress bar callback."""
+
+    def test_callback_importable(self):
+        from optimizer.runner import ProgressCallback
+        cb = ProgressCallback(n_gen=10, pop_size=50,
+                              propellant_name="Test", show_bar=False)
+        assert cb is not None
+
+    def test_callback_runs_without_tqdm(self):
+        """show_bar=False should fall back to plain text without crashing."""
+        import io, sys
+        from optimizer.runner import ProgressCallback
+        from pymoo.algorithms.moo.nsga2 import NSGA2
+        from pymoo.optimize import minimize
+        from pymoo.termination import get_termination
+        from pymoo.core.problem import Problem
+
+        class TinyProblem(Problem):
+            def __init__(self):
+                super().__init__(n_var=2, n_obj=2, xl=np.zeros(2), xu=np.ones(2))
+            def _evaluate(self, X, out, *args, **kwargs):
+                out["F"] = X
+
+        cb = ProgressCallback(n_gen=2, pop_size=4,
+                              propellant_name="Hydrolox", show_bar=False)
+        captured = io.StringIO()
+        sys.stdout = captured
+        try:
+            res = minimize(TinyProblem(), NSGA2(pop_size=4),
+                           get_termination("n_gen", 2),
+                           callback=cb, verbose=False, seed=1)
+        finally:
+            sys.stdout = sys.__stdout__
+        output = captured.getvalue()
+        assert "gen" in output.lower()
+
+    def test_fmt_time(self):
+        from optimizer.runner import _fmt_time
+        assert "s" in _fmt_time(45)
+        assert "m" in _fmt_time(90)
+        assert "h" in _fmt_time(3700)
+        assert _fmt_time(0) == "0s"
+        assert _fmt_time(3661) == "1h01m01s"
+
+
+# ---------------------------------------------------------------------------
+# Earth-escape constraint tests
+# ---------------------------------------------------------------------------
+
+class TestEscapeConstraint:
+    """Tests for the Earth-escape pre-check in check_masses."""
+
+    def test_sufficient_fuel_passes(self, hydrolox, nominal_x):
+        m = derive_masses(nominal_x, hydrolox)
+        err = check_masses(m, isp_vac_s=hydrolox.isp_vac_s)
+        assert err is None, f"Expected pass, got: {err}"
+
+    def test_insufficient_tmi_fuel_fails(self, kerolox):
+        """Kerolox with only 20k total fuel cannot escape (needs ~80k)."""
+        x = np.zeros(N_VAR)
+        x[IDX_EPOCH]    = 2_461_314.5
+        x[IDX_TOF]      = 250.0
+        x[IDX_THRUST]   = 150_000.0
+        x[IDX_STRUCT]   = 5_000.0
+        x[IDX_MOI_FRAC] = 0.30
+        x[IDX_FUEL]     = 20_000.0   # too little for kerolox
+        x[IDX_COAST]    = 0.3
+        m = derive_masses(x, kerolox)
+        err = check_masses(m, isp_vac_s=kerolox.isp_vac_s)
+        assert err is not None
+        assert "escape" in err.lower() or "dV" in err or "dv" in err.lower()
+
+    def test_hydrolox_needs_less_fuel_than_kerolox(self):
+        """Lower-Isp propellants require more fuel to escape."""
+        from optimizer.propellants import PROPELLANTS
+        hydro   = PROPELLANTS["hydrolox"]
+        kero    = PROPELLANTS["kerolox"]
+        m_struct, moi_frac = 5_000.0, 0.30
+
+        # Find minimum fuel for each by checking escape at increasing fuel
+        def min_fuel(prop):
+            for fuel in range(10_000, 200_000, 2_000):
+                x = np.array([2_461_314.5, 250.0, 150_000.0,
+                               m_struct, moi_frac, float(fuel), 0.3])
+                m = derive_masses(x, prop)
+                if check_masses(m, isp_vac_s=prop.isp_vac_s) is None:
+                    return fuel
+            return 200_000
+
+        fuel_hydro = min_fuel(hydro)
+        fuel_kero  = min_fuel(kero)
+        assert fuel_hydro < fuel_kero, \
+            f"Expected hydrolox({fuel_hydro}) < kerolox({fuel_kero})"
+
+    def test_escape_not_checked_without_isp(self, kerolox):
+        """Without isp_vac_s, escape is not checked (backward-compatible)."""
+        x = np.zeros(N_VAR)
+        x[IDX_EPOCH]    = 2_461_314.5
+        x[IDX_TOF]      = 250.0
+        x[IDX_THRUST]   = 150_000.0
+        x[IDX_STRUCT]   = 5_000.0
+        x[IDX_MOI_FRAC] = 0.30
+        x[IDX_FUEL]     = 5_000.0
+        x[IDX_COAST]    = 0.3
+        m = derive_masses(x, kerolox)
+        # Without isp, only structural constraints checked
+        # (may pass or fail on non-escape grounds — we just check no escape error)
+        err = check_masses(m, isp_vac_s=None)
+        if err is not None:
+            assert "escape" not in err.lower()
+
+    def test_objective_penalises_no_escape(self, kerolox):
+        """ObjectiveFunction.objectives() returns BIG for insufficient fuel."""
+        obj = ObjectiveFunction(propellant=kerolox, cache_path=None)
+        x = np.zeros(N_VAR)
+        x[IDX_EPOCH]    = 2_461_314.5
+        x[IDX_TOF]      = 250.0
+        x[IDX_THRUST]   = 150_000.0
+        x[IDX_STRUCT]   = 5_000.0
+        x[IDX_MOI_FRAC] = 0.30
+        x[IDX_FUEL]     = 20_000.0   # can't escape with kerolox
+        x[IDX_COAST]    = 0.3
+        tof, fuel, cost = obj.objectives(x)
+        assert tof == BIG and fuel == BIG and cost == BIG
+
+    def test_fuel_lower_bound_raised(self):
+        """total_fuel_kg lower bound should be at least 20,000 kg."""
+        assert LOWER_BOUNDS[IDX_FUEL] >= 20_000.0, \
+            f"Fuel lower bound {LOWER_BOUNDS[IDX_FUEL]} is too low"
