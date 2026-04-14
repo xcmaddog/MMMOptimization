@@ -185,6 +185,28 @@ class EvalCache:
             "db_path":    self.db_path,
         }
 
+    def fetch_feasible(self, propellant_key: str, limit: int = 50) -> list[np.ndarray]:
+        """
+        Return up to `limit` feasible design vectors for a given propellant.
+
+        Uses the stored x_repr field for reconstruction; ordering is newest first.
+        """
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT x_repr FROM evaluations "
+            "WHERE feasible=1 AND propellant=? "
+            "ORDER BY evaluated_at DESC LIMIT ?",
+            (propellant_key, int(limit)),
+        ).fetchall()
+        out: list[np.ndarray] = []
+        for (x_repr,) in rows:
+            try:
+                vals = [float(v) for v in str(x_repr).split(",")]
+                out.append(np.array(vals, dtype=float))
+            except Exception:
+                continue
+        return out
+
     def clear(self) -> None:
         """Delete all cached results (useful for testing)."""
         conn = self._conn()

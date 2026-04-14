@@ -128,6 +128,12 @@ def run_single(
     n_seeds:     int   = 20,
     seed_frac:   float = 0.5,
     rng_seed:    int   = 42,
+    seed_feasible: bool = True,
+    seed_eval_budget: int | None = None,
+    seed_max_seconds: float | None = 60.0,
+    seed_verbose: bool = True,
+    seed_cache_only: bool = False,
+    seed_min_eval_seconds: float = 5.0,
     verbose:     bool  = True,
     show_progress: bool = True,
 ) -> dict:
@@ -172,6 +178,12 @@ def run_single(
         n_seeds=n_seeds,
         seed_frac=seed_frac,
         rng_seed=rng_seed,
+        seed_feasible=seed_feasible,
+        seed_eval_budget=seed_eval_budget,
+        seed_max_seconds=seed_max_seconds,
+        seed_verbose=seed_verbose,
+        seed_cache_only=seed_cache_only,
+        seed_min_eval_seconds=seed_min_eval_seconds,
     )
     algo     = NSGA2(pop_size=pop_size, eliminate_duplicates=True)
     term     = get_termination("n_gen", n_gen)
@@ -219,6 +231,12 @@ def run_all_propellants(
     n_seeds:     int   = 20,
     seed_frac:   float = 0.5,
     rng_seed:    int   = 42,
+    seed_feasible: bool = True,
+    seed_eval_budget: int | None = None,
+    seed_max_seconds: float | None = 60.0,
+    seed_verbose: bool = True,
+    seed_cache_only: bool = False,
+    seed_min_eval_seconds: float = 5.0,
     verbose:     bool  = True,
     show_progress: bool = True,
     **obj_fn_kwargs,
@@ -233,6 +251,12 @@ def run_all_propellants(
             pop_size=pop_size, n_gen=n_gen,
             n_workers=n_workers, n_seeds=n_seeds,
             seed_frac=seed_frac, rng_seed=rng_seed,
+            seed_feasible=seed_feasible,
+            seed_eval_budget=seed_eval_budget,
+            seed_max_seconds=seed_max_seconds,
+            seed_verbose=seed_verbose,
+            seed_cache_only=seed_cache_only,
+            seed_min_eval_seconds=seed_min_eval_seconds,
             verbose=verbose, show_progress=show_progress,
         )
     return results

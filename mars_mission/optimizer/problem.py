@@ -52,6 +52,8 @@ class SeededSampling(Sampling):
         self._rng      = np.random.default_rng(rng_seed)
 
     def _do(self, problem, n_samples, **kwargs):
+        if len(self._seeds) == 0:
+            return self._rng.uniform(LOWER_BOUNDS, UPPER_BOUNDS, size=(n_samples, N_VAR))
         n_seed = min(len(self._seeds), max(1, int(n_samples * self._seed_frac)))
         n_rand = n_samples - n_seed
         chosen = self._seeds[np.arange(n_seed) % len(self._seeds)]
@@ -85,13 +87,29 @@ class MarsTransferProblem(Problem):
         n_seeds: int              = 20,
         seed_frac: float          = 0.5,
         rng_seed: int             = 42,
+        seed_feasible: bool       = True,
+        seed_eval_budget: int | None = None,
+        seed_max_seconds: float | None = 60.0,
+        seed_verbose: bool        = True,
+        seed_cache_only: bool     = False,
+        seed_min_eval_seconds: float = 5.0,
     ):
         self.obj_fn    = objective_fn
         self.n_workers = n_workers
 
         if seeds is None:
-            seeds = generate_seeds(objective_fn.propellant,
-                                   n_seeds=n_seeds, rng_seed=rng_seed)
+            seeds = generate_seeds(
+                objective_fn.propellant,
+                n_seeds=n_seeds,
+                rng_seed=rng_seed,
+                objective_fn=objective_fn,
+                require_feasible=seed_feasible,
+                max_evals=seed_eval_budget,
+                max_seconds=seed_max_seconds,
+                verbose=seed_verbose,
+                cache_only=seed_cache_only,
+                min_eval_seconds=seed_min_eval_seconds,
+            )
         sampling = SeededSampling(seeds, seed_frac=seed_frac, rng_seed=rng_seed)
 
         super().__init__(

@@ -449,6 +449,16 @@ def generate_seeds(
     propellant: Propellant,
     n_seeds: int = 20,
     rng_seed: int = 0,
+    objective_fn: "ObjectiveFunction | None" = None,
+    require_feasible: bool = False,
+    max_evals: int | None = None,
+    max_seconds: float | None = 60.0,
+    verbose: bool = True,
+    progress_every: int = 10,
+    fallback_to_lambert: bool = True,
+    cache_seed_limit: int = 50,
+    cache_only: bool = False,
+    min_eval_seconds: float = 5.0,
 ) -> np.ndarray:
     """
     Generate warm-start design vectors from the confirmed Lambert anchor points.
@@ -459,21 +469,95 @@ def generate_seeds(
       so seeds span a range of the objective space.
     - Jitter epoch and TOF slightly around each anchor.
 
-    Pads with uniform-random samples if fewer than n_seeds survive mass checks.
+    If require_feasible and an ObjectiveFunction is supplied, runs the full
+    simulator to keep only seeds that are actually mission-feasible. This is
+    slower but avoids cold-starting the optimizer in infeasible space.
+
+    Pads with uniform-random samples if fewer than n_seeds survive mass checks
+    (unless require_feasible=True, in which case only feasible seeds are returned).
 
     Returns
     -------
     np.ndarray of shape (n_seeds, N_VAR), within bounds.
     """
+    import time
     rng = np.random.default_rng(rng_seed)
     Isp = propellant.isp_vac_s
 
     seeds: list[np.ndarray] = []
+    feasible_only = bool(require_feasible and objective_fn is not None)
+    eval_budget = max_evals
+    if feasible_only and eval_budget is None:
+        eval_budget = max(40, n_seeds * 6)
+    eval_count = 0
+    t0 = time.perf_counter()
+
+    if feasible_only and verbose:
+        print(
+            f"Seeding with feasible Lambert starts for {propellant.name} "
+            f"(target={n_seeds}, eval_budget={eval_budget}, "
+            f"max_seconds={max_seconds if max_seconds is not None else 'none'})"
+        )
+
+    # First, pull any feasible seeds from the disk cache (fast).
+    if feasible_only and objective_fn is not None and objective_fn._disk_cache is not None:
+        cached = objective_fn._disk_cache.fetch_feasible(
+            propellant.key, limit=max(cache_seed_limit, n_seeds)
+        )
+        for x in cached:
+            if len(seeds) >= n_seeds:
+                break
+            x = np.clip(x, LOWER_BOUNDS, UPPER_BOUNDS)
+            m = derive_masses(x, propellant)
+            if check_masses(m, isp_vac_s=propellant.isp_vac_s) is None:
+                seeds.append(x)
+        if verbose and len(cached):
+            print(f"  cache seeds={len(cached)}  accepted={len(seeds)}")
+
+    def maybe_add(x: np.ndarray) -> None:
+        nonlocal eval_count
+        if feasible_only and cache_only:
+            return
+        if feasible_only and max_seconds is not None:
+            elapsed = time.perf_counter() - t0
+            if elapsed >= max_seconds:
+                return
+            remaining = max_seconds - elapsed
+            if remaining < max(0.0, min_eval_seconds):
+                return
+            # Avoid starting a long evaluation if we're likely to overrun.
+            if eval_count > 0:
+                avg_eval = elapsed / eval_count
+                if (elapsed + avg_eval) >= max_seconds:
+                    return
+        if not feasible_only:
+            seeds.append(x)
+            return
+        if eval_budget is not None and eval_count >= eval_budget:
+            return
+        eval_count += 1
+        try:
+            r = objective_fn.evaluate(x)
+        except Exception:
+            return
+        if r.get("feasible", False):
+            seeds.append(x)
+        if verbose and feasible_only and (eval_count % max(1, progress_every) == 0):
+            elapsed = time.perf_counter() - t0
+            print(
+                f"  seed evals={eval_count}  feasible={len(seeds)}  "
+                f"elapsed={elapsed:.1f}s"
+            )
 
     # How many variants to generate per anchor
     variants_per_anchor = max(1, n_seeds // len(KNOWN_GOOD_ANCHORS) + 2)
 
     for jd_anchor, tof_anchor in KNOWN_GOOD_ANCHORS:
+        if feasible_only and max_seconds is not None:
+            if (time.perf_counter() - t0) >= max_seconds:
+                break
+        if feasible_only and cache_only:
+            break
         dep = Time(jd_anchor, format="jd", scale="tdb")
 
         try:
@@ -527,12 +611,38 @@ def generate_seeds(
             # Quick mass sanity check before adding
             m = derive_masses(x, propellant)
             if check_masses(m, isp_vac_s=propellant.isp_vac_s) is None:
-                seeds.append(x)
+                maybe_add(x)
 
-    # Pad with uniform-random samples
+    if feasible_only and not cache_only:
+        # Try additional random samples to reach target count (within budget)
+        while len(seeds) < n_seeds:
+            if max_seconds is not None and (time.perf_counter() - t0) >= max_seconds:
+                break
+            if eval_budget is not None and eval_count >= eval_budget:
+                break
+            x = rng.uniform(LOWER_BOUNDS, UPPER_BOUNDS)
+            x = np.clip(x, LOWER_BOUNDS, UPPER_BOUNDS)
+            m = derive_masses(x, propellant)
+            if check_masses(m, isp_vac_s=propellant.isp_vac_s) is None:
+                maybe_add(x)
+        if verbose:
+            elapsed = time.perf_counter() - t0
+            print(
+                f"Feasible seeding complete: {len(seeds)} seeds in "
+                f"{elapsed:.1f}s (evals={eval_count})."
+            )
+        if len(seeds) >= n_seeds or not fallback_to_lambert:
+            return np.array(seeds)
+        if verbose:
+            print("  Falling back to Lambert-only seeds to fill remaining slots.")
+
+    # If we need more, fill with non-feasible Lambert/random seeds (fast)
     while len(seeds) < n_seeds:
         x = rng.uniform(LOWER_BOUNDS, UPPER_BOUNDS)
-        seeds.append(np.clip(x, LOWER_BOUNDS, UPPER_BOUNDS))
+        x = np.clip(x, LOWER_BOUNDS, UPPER_BOUNDS)
+        m = derive_masses(x, propellant)
+        if check_masses(m, isp_vac_s=propellant.isp_vac_s) is None:
+            seeds.append(x)
 
     return np.array(seeds[:n_seeds])
 

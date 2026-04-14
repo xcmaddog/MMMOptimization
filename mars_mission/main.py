@@ -163,6 +163,30 @@ def main() -> None:
     parser.add_argument("--seed-frac", type=float, default=0.5,
                         help="Fraction of initial population filled with seeds")
     parser.add_argument("--seed",    type=int,   default=42,  help="RNG seed")
+    parser.add_argument(
+        "--no-feasible-seeds", action="store_true",
+        help="Disable simulator-verified feasible seeding (faster, less reliable)",
+    )
+    parser.add_argument(
+        "--seed-eval-budget", type=int, default=120,
+        help="Max seed evaluations for feasible seeding (per propellant)",
+    )
+    parser.add_argument(
+        "--seed-max-seconds", type=float, default=60.0,
+        help="Max wall-clock seconds to spend generating feasible seeds per propellant",
+    )
+    parser.add_argument(
+        "--seed-quiet", action="store_true",
+        help="Suppress feasible-seed progress logging",
+    )
+    parser.add_argument(
+        "--seed-cache-only", action="store_true",
+        help="Only use cached feasible seeds (no new simulator evaluations)",
+    )
+    parser.add_argument(
+        "--seed-min-eval-seconds", type=float, default=5.0,
+        help="Minimum remaining seconds required to start a new seed evaluation",
+    )
     parser.add_argument("--out",     default="output",        help="Output directory")
     parser.add_argument("--info",    action="store_true",
                         help="Print design-space info and exit")
@@ -193,6 +217,12 @@ def main() -> None:
         n_seeds    = args.n_seeds,
         seed_frac  = args.seed_frac,
         rng_seed   = args.seed,
+        seed_feasible = not args.no_feasible_seeds,
+        seed_eval_budget = args.seed_eval_budget,
+        seed_max_seconds = args.seed_max_seconds,
+        seed_verbose = not args.seed_quiet,
+        seed_cache_only = args.seed_cache_only,
+        seed_min_eval_seconds = args.seed_min_eval_seconds,
         verbose    = True,
     )
 
